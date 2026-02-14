@@ -291,23 +291,25 @@ jobs:
                   fi
 
                   # Build file additions JSON for GraphQL createCommitOnBranch
-                  FILES_JSON="[]"
+                  # Use file-based approach to avoid "Argument list too long" with large license files
+                  echo '[' > /tmp/files.json
+                  FIRST=true
                   for file in $PYTHON_ASYNC_ATTRIBUTIONS $PYTHON_SYNC_ATTRIBUTIONS $NODE_ATTRIBUTIONS $RUST_ATTRIBUTIONS $JAVA_ATTRIBUTIONS $GO_ATTRIBUTIONS; do
-                    ENCODED=$(base64 -w 0 "$file")
-                    FILES_JSON=$(echo "$FILES_JSON" | jq \
-                      --arg path "$file" \
-                      --arg contents "$ENCODED" \
-                      '. + [{"path": $path, "contents": $contents}]')
+                    if [ "$FIRST" = true ]; then FIRST=false; else echo ',' >> /tmp/files.json; fi
+                    printf '{"path":"%s","contents":"' "$file" >> /tmp/files.json
+                    base64 -w 0 "$file" >> /tmp/files.json
+                    printf '"}' >> /tmp/files.json
                   done
+                  echo ']' >> /tmp/files.json
 
                   # Create signed commit via GraphQL API
                   EXPECTED_OID=$(gh api "repos/${REPO}/git/ref/heads/${ORT_DIFF_BRANCH_NAME}" --jq '.object.sha')
-                  echo "$FILES_JSON" | gh api graphql \
+                  gh api graphql \
                     -F "repositoryNameWithOwner=${REPO}" \
                     -F "branchName=${ORT_DIFF_BRANCH_NAME}" \
                     -F "expectedHeadOid=${EXPECTED_OID}" \
                     -F "commitMessage=Updated attribution files for commit ${TARGET_COMMIT}" \
-                    -F 'files=@-' \
+                    -F 'files=@/tmp/files.json' \
                     -f query='
                       mutation CreateSignedCommit(
                         $repositoryNameWithOwner: String!
