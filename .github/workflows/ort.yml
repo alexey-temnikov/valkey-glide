@@ -271,9 +271,7 @@ jobs:
                     echo "FOUND_DIFF=false" >> $GITHUB_ENV
                   fi
 
-              ### Create PR, Note a potential race on the source branch ###
-              ### Uses GitHub Git Data API for auto-signed commits ###
-              ### Blobs uploaded individually to handle large license files ###
+              ### Create PR using GitHub REST API for auto-signed commits ###
             - name: Create pull request
               if: ${{ env.FOUND_DIFF  == 'true' && github.event_name != 'pull_request' }}
               run: |
@@ -281,47 +279,27 @@ jobs:
                   export REPO="${{ github.repository }}"
                   echo "Creating pull request from branch $ORT_DIFF_BRANCH_NAME to branch $TARGET_BRANCH"
 
-                  # Get the base tree from TARGET_BRANCH
+                  # Create or reset branch to TARGET_BRANCH HEAD
                   TARGET_SHA=$(gh api "repos/${REPO}/git/ref/heads/${TARGET_BRANCH}" --jq '.object.sha')
-                  BASE_TREE=$(gh api "repos/${REPO}/git/commits/${TARGET_SHA}" --jq '.tree.sha')
-
-                  # Upload each file as a blob and build tree entries
-                  TREE_ENTRIES="[]"
-                  for file in $PYTHON_ASYNC_ATTRIBUTIONS $PYTHON_SYNC_ATTRIBUTIONS $NODE_ATTRIBUTIONS $RUST_ATTRIBUTIONS $JAVA_ATTRIBUTIONS $GO_ATTRIBUTIONS; do
-                    echo "Uploading blob for $file..."
-                    # Write JSON payload to temp file to avoid arg list too long
-                    printf '{"content":"' > /tmp/blob_payload.json
-                    base64 -w 0 "$file" >> /tmp/blob_payload.json
-                    printf '","encoding":"base64"}' >> /tmp/blob_payload.json
-                    BLOB_SHA=$(gh api "repos/${REPO}/git/blobs" --input /tmp/blob_payload.json --jq '.sha')
-                    echo "  -> blob $BLOB_SHA"
-                    TREE_ENTRIES=$(echo "$TREE_ENTRIES" | jq \
-                      --arg path "$file" \
-                      --arg sha "$BLOB_SHA" \
-                      '. + [{"path": $path, "mode": "100644", "type": "blob", "sha": $sha}]')
-                  done
-
-                  # Create tree
-                  TREE_SHA=$(echo "$TREE_ENTRIES" | jq -c '{base_tree: "'"$BASE_TREE"'", tree: .}' | \
-                    gh api "repos/${REPO}/git/trees" --input - --jq '.sha')
-                  echo "Tree: $TREE_SHA"
-
-                  # Create commit (auto-signed when using GITHUB_TOKEN)
-                  COMMIT_SHA=$(gh api "repos/${REPO}/git/commits" \
-                    -f message="Updated attribution files for commit ${TARGET_COMMIT}" \
-                    -f tree="$TREE_SHA" \
-                    -f "parents[]=$TARGET_SHA" \
-                    --jq '.sha')
-                  echo "Commit: $COMMIT_SHA"
-
-                  # Create or update branch ref
                   if gh api "repos/${REPO}/git/ref/heads/${ORT_DIFF_BRANCH_NAME}" >/dev/null 2>&1; then
                     gh api -X PATCH "repos/${REPO}/git/refs/heads/${ORT_DIFF_BRANCH_NAME}" \
-                      -f sha="$COMMIT_SHA" -F force=true
+                      -f sha="$TARGET_SHA" -F force=true
                   else
                     gh api "repos/${REPO}/git/refs" \
-                      -f ref="refs/heads/${ORT_DIFF_BRANCH_NAME}" -f sha="$COMMIT_SHA"
+                      -f ref="refs/heads/${ORT_DIFF_BRANCH_NAME}" -f sha="$TARGET_SHA"
                   fi
+
+                  # Commit each file via REST API (commits are auto-signed by GitHub)
+                  for file in $PYTHON_ASYNC_ATTRIBUTIONS $PYTHON_SYNC_ATTRIBUTIONS $NODE_ATTRIBUTIONS $RUST_ATTRIBUTIONS $JAVA_ATTRIBUTIONS $GO_ATTRIBUTIONS; do
+                    echo "Committing $file..."
+                    FILE_SHA=$(gh api "repos/${REPO}/contents/${file}?ref=${ORT_DIFF_BRANCH_NAME}" --jq '.sha')
+                    base64 -w 0 "$file" > /tmp/encoded.txt
+                    gh api --method PUT "repos/${REPO}/contents/${file}" \
+                      --field message="Updated ${file}" \
+                      --field "content=@/tmp/encoded.txt" \
+                      --field branch="${ORT_DIFF_BRANCH_NAME}" \
+                      --field sha="${FILE_SHA}" > /dev/null
+                  done
 
                   # Check if PR already exists
                   existing_pr=$(gh pr list --base ${TARGET_BRANCH} --head ${ORT_DIFF_BRANCH_NAME} --json number --jq '.[0].number')
