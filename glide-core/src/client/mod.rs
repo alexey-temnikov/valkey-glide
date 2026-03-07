@@ -1344,9 +1344,15 @@ impl Client {
         move |new_token: String| {
             let client_arc = Arc::clone(&client_arc);
             tokio::spawn(async move {
-                let mut client = client_arc.write().await;
+                // Clone the client under a brief read lock, then drop the lock.
+                // update_connection_password does network I/O; holding write() for
+                // its entire duration blocks any concurrent client creation.
+                let mut client = {
+                    let guard = client_arc.read().await;
+                    guard.clone()
+                };
                 let result = client
-                    .update_connection_password(Some(new_token.clone()), true)
+                    .update_connection_password(Some(new_token.clone()), false)
                     .await;
 
                 if let Err(e) = result {
