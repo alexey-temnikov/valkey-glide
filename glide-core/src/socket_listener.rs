@@ -25,13 +25,11 @@ use redis::cluster_routing::{ResponsePolicy, Routable};
 use redis::{
     ClusterScanArgs, Cmd, PipelineRetryStrategy, PushInfo, RedisError, ScanStateRC, Value,
 };
-use std::cell::Cell;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::ptr::from_mut;
-use std::rc::Rc;
 use std::str;
 use std::sync::{Arc, RwLock};
 use telemetrylib::{GlideSpan, GlideSpanStatus};
@@ -40,8 +38,6 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Sender, channel};
-use tokio::task;
-use tokio_util::task::LocalPoolHandle;
 use uuid::Uuid;
 
 /// The socket file name
@@ -61,15 +57,15 @@ pub const STREAM: &str = "stream";
 
 /// struct containing all objects needed to read from a unix stream.
 struct UnixStreamListener {
-    read_socket: Rc<UnixStream>,
+    read_socket: Arc<UnixStream>,
     rotating_buffer: RotatingBuffer,
 }
 
 /// struct containing all objects needed to write to a socket.
 struct Writer {
-    socket: Rc<UnixStream>,
+    socket: Arc<UnixStream>,
     lock: Mutex<()>,
-    accumulated_outputs: Cell<Vec<u8>>,
+    accumulated_outputs: std::sync::Mutex<Vec<u8>>,
     closing_sender: Sender<ClosingReason>,
 }
 
@@ -85,7 +81,7 @@ impl<T: Message> From<ClosingReason> for PipeListeningResult<T> {
 }
 
 impl UnixStreamListener {
-    fn new(read_socket: Rc<UnixStream>) -> Self {
+    fn new(read_socket: Arc<UnixStream>) -> Self {
         // if the logger has been initialized by the user (external or internal) on info level this log will be shown
         log_debug("connection", "new socket listener initiated");
         let rotating_buffer = RotatingBuffer::new(65_536);
@@ -132,12 +128,12 @@ impl UnixStreamListener {
     }
 }
 
-async fn write_to_output(writer: &Rc<Writer>) {
+async fn write_to_output(writer: &Arc<Writer>) {
     let Ok(_guard) = writer.lock.try_lock() else {
         return;
     };
 
-    let mut output = writer.accumulated_outputs.take();
+    let mut output = std::mem::take(&mut *writer.accumulated_outputs.lock().unwrap());
     loop {
         if output.is_empty() {
             return;
@@ -145,7 +141,7 @@ async fn write_to_output(writer: &Rc<Writer>) {
         let mut total_written_bytes = 0;
         while total_written_bytes < output.len() {
             if let Err(err) = writer.socket.writable().await {
-                let _res = writer.closing_sender.send(err.into()).await; // we ignore the error, because it means that the reader was dropped, which is ok.
+                let _res = writer.closing_sender.send(err.into()).await;
                 return;
             }
             match writer.socket.try_write(&output[total_written_bytes..]) {
@@ -159,20 +155,20 @@ async fn write_to_output(writer: &Rc<Writer>) {
                     continue;
                 }
                 Err(err) => {
-                    let _res = writer.closing_sender.send(err.into()).await; // we ignore the error, because it means that the reader was dropped, which is ok.
+                    let _res = writer.closing_sender.send(err.into()).await;
                     return;
                 }
             }
         }
         output.clear();
-        output = writer.accumulated_outputs.replace(output);
+        output = std::mem::replace(&mut *writer.accumulated_outputs.lock().unwrap(), output);
     }
 }
 
 async fn write_closing_error(
     err: ClosingError,
     callback_index: u32,
-    writer: &Rc<Writer>,
+    writer: &Arc<Writer>,
     identifier: &str,
 ) -> Result<(), io::Error> {
     let err = err.err_message;
@@ -187,7 +183,7 @@ async fn write_closing_error(
 async fn write_result(
     resp_result: ClientUsageResult<Value>,
     callback_index: u32,
-    writer: &Rc<Writer>,
+    writer: &Arc<Writer>,
     command_span_ptr: Option<u64>,
 ) -> Result<(), io::Error> {
     let mut response = Response::new();
@@ -258,14 +254,13 @@ async fn write_result(
     write_to_writer(response, writer).await
 }
 
-async fn write_to_writer(response: Response, writer: &Rc<Writer>) -> Result<(), io::Error> {
-    let mut vec = writer.accumulated_outputs.take();
+async fn write_to_writer(response: Response, writer: &Arc<Writer>) -> Result<(), io::Error> {
+    let mut vec = std::mem::take(&mut *writer.accumulated_outputs.lock().unwrap());
     let encode_result = response.write_length_delimited_to_vec(&mut vec);
 
-    // Write the response' length to the buffer
     match encode_result {
         Ok(_) => {
-            writer.accumulated_outputs.set(vec);
+            *writer.accumulated_outputs.lock().unwrap() = vec;
             write_to_output(writer).await;
             Ok(())
         }
@@ -531,8 +526,8 @@ fn get_route(
     }
 }
 
-fn handle_request(request: CommandRequest, mut client: Client, writer: Rc<Writer>) {
-    task::spawn_local(async move {
+fn handle_request(request: CommandRequest, mut client: Client, writer: Arc<Writer>) {
+    tokio::spawn(async move {
         let mut updated_inflight_counter = true;
         let client_clone = client.clone();
 
@@ -644,13 +639,13 @@ fn handle_request(request: CommandRequest, mut client: Client, writer: Rc<Writer
 async fn handle_requests(
     received_requests: Vec<CommandRequest>,
     client: &Client,
-    writer: &Rc<Writer>,
+    writer: &Arc<Writer>,
 ) {
     for request in received_requests {
         handle_request(request, client.clone(), writer.clone());
     }
     // Yield to ensure that the subtasks aren't starved.
-    task::yield_now().await;
+    tokio::task::yield_now().await;
 }
 
 /// This function converts a raw pointer to a GlideSpan into a safe Rust reference.
@@ -687,7 +682,7 @@ pub fn close_socket(socket_path: &String) {
 }
 
 async fn create_client(
-    writer: &Rc<Writer>,
+    writer: &Arc<Writer>,
     request: ConnectionRequest,
     push_tx: Option<mpsc::UnboundedSender<PushInfo>>,
 ) -> Result<Client, ClientCreationError> {
@@ -701,7 +696,7 @@ async fn create_client(
 
 async fn wait_for_connection_configuration_and_create_client(
     client_listener: &mut UnixStreamListener,
-    writer: &Rc<Writer>,
+    writer: &Arc<Writer>,
     push_tx: Option<mpsc::UnboundedSender<PushInfo>>,
 ) -> Result<Client, ClientCreationError> {
     // Wait for the server's address
@@ -722,7 +717,7 @@ async fn wait_for_connection_configuration_and_create_client(
 async fn read_values_loop(
     mut client_listener: UnixStreamListener,
     client: &Client,
-    writer: Rc<Writer>,
+    writer: Arc<Writer>,
 ) -> ClosingReason {
     loop {
         match client_listener.next_values().await {
@@ -736,7 +731,7 @@ async fn read_values_loop(
     }
 }
 
-async fn push_manager_loop(mut push_rx: mpsc::UnboundedReceiver<PushInfo>, writer: Rc<Writer>) {
+async fn push_manager_loop(mut push_rx: mpsc::UnboundedReceiver<PushInfo>, writer: Arc<Writer>) {
     loop {
         let result = push_rx.recv().await;
         match result {
@@ -766,14 +761,13 @@ async fn push_manager_loop(mut push_rx: mpsc::UnboundedReceiver<PushInfo>, write
 }
 
 async fn listen_on_client_stream(socket: UnixStream) {
-    let socket = Rc::new(socket);
-    // Spawn a new task to listen on this client's stream
+    let socket = Arc::new(socket);
     let write_lock = Mutex::new(());
     let mut client_listener = UnixStreamListener::new(socket.clone());
-    let accumulated_outputs = Cell::new(Vec::new());
+    let accumulated_outputs = std::sync::Mutex::new(Vec::new());
     let (sender, mut receiver) = channel(1);
     let (push_tx, push_rx) = tokio::sync::mpsc::unbounded_channel();
-    let writer = Rc::new(Writer {
+    let writer = Arc::new(Writer {
         socket,
         lock: write_lock,
         accumulated_outputs,
@@ -1010,11 +1004,10 @@ pub fn start_socket_listener_internal<InitCallback>(
         // Signal initialization is successful.
         let _ = tx.send(Ok(socket_path_cloned.clone()));
 
-        let local_set_pool = LocalPoolHandle::new(num_cpus::get());
         loop {
             match listener_socket.accept().await {
                 Ok((stream, _addr)) => {
-                    local_set_pool.spawn_pinned(move || listen_on_client_stream(stream));
+                    tokio::spawn(listen_on_client_stream(stream));
                 }
                 Err(err) => {
                     log_error(

@@ -71,10 +71,10 @@ pub struct GlideRt {
     shutdown_notifier: Arc<Notify>,
 }
 
-/// Initializes a single-threaded Tokio runtime in a dedicated thread (if not already initialized)
+/// Initializes a multi-threaded Tokio runtime in a dedicated thread (if not already initialized)
 /// and returns a static reference to the `GlideRt` wrapper, which holds the runtime handle and a shutdown notifier.
-/// The runtime remains active indefinitely until a shutdown is triggered via the notifier, allowing tasks to be spawned
-/// throughout the lifetime of the application.
+/// Using a multi-threaded runtime ensures that timers advance independently of task execution,
+/// preventing deadlocks caused by runtime starvation under sustained network partition.
 pub fn get_or_init_runtime() -> Result<&'static GlideRt, String> {
     RUNTIME.get_or_try_init(|| {
         let notify = Arc::new(Notify::new());
@@ -85,7 +85,11 @@ pub fn get_or_init_runtime() -> Result<&'static GlideRt, String> {
         let thread_handle = thread::Builder::new()
             .name("glide-runtime-thread".into())
             .spawn(move || {
-                match Builder::new_current_thread().enable_all().build() {
+                match Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                {
                     Ok(runtime) => {
                         let _ = tx.send(Ok(runtime.handle().clone()));
                         // Keep runtime alive until shutdown is signaled
@@ -1264,6 +1268,23 @@ async fn create_cluster_client(
 
     // Always use with Glide
     builder = builder.periodic_connections_checks(Some(CONNECTION_CHECKS_INTERVAL));
+
+    // Set response_timeout so that the per-connection pipeline timeout is finite.
+    // Without this, response_timeout defaults to Duration::MAX and the timeout in
+    // send_recv() never fires, causing permanent deadlock under network partition.
+    // Use request_timeout/(retries+2) so that all retry attempts complete well
+    // within the user's request_timeout, allowing the cluster to mark dead
+    // connections and return fast ClosingException errors instead of slow
+    // TimeoutException from run_with_timeout.
+    let request_timeout = to_duration(request.request_timeout, DEFAULT_RESPONSE_TIMEOUT);
+    // Set per-attempt timeouts short enough that half-open connections are
+    // detected quickly. With fail_pending_requests failing requests during
+    // recovery, requests that arrive after recovery starts go through
+    // get_connection + send_recv. Using request_timeout/20 ensures these
+    // complete well within request_timeout even with retries.
+    let per_attempt_timeout = (request_timeout / 20).max(Duration::from_millis(50));
+    builder = builder.response_timeout(per_attempt_timeout);
+    builder = builder.connection_timeout(connection_timeout.min(per_attempt_timeout));
 
     let client = builder.build()?;
     let mut con = client.get_async_connection(push_sender).await?;

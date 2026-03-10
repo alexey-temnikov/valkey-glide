@@ -84,7 +84,7 @@ struct PipelineMessage<S> {
 /// and `Sink`.
 #[derive(Clone)]
 pub(crate) struct Pipeline<SinkItem> {
-    sender: mpsc::Sender<PipelineMessage<SinkItem>>,
+    sender: mpsc::UnboundedSender<PipelineMessage<SinkItem>>,
     push_manager: Arc<ArcSwap<PushManager>>,
     is_stream_closed: Arc<AtomicBool>,
 }
@@ -340,8 +340,7 @@ where
         T::Error: Send,
         T::Error: ::std::fmt::Debug,
     {
-        const BUFFER_SIZE: usize = 50;
-        let (sender, mut receiver) = mpsc::channel(BUFFER_SIZE);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
         let push_manager: Arc<ArcSwap<PushManager>> =
             Arc::new(ArcSwap::new(Arc::new(PushManager::default())));
         let is_stream_closed = Arc::new(AtomicBool::new(false));
@@ -380,6 +379,8 @@ where
     ) -> Result<Value, RedisError> {
         let (sender, receiver) = oneshot::channel();
 
+        // Use unbounded send (never blocks) so the Tokio runtime stays responsive
+        // and timeouts can fire even under load.
         self.sender
             .send(PipelineMessage {
                 input,
@@ -387,11 +388,7 @@ where
                 output: sender,
                 is_transaction: is_atomic,
             })
-            .await
             .map_err(|err| {
-                // If an error occurs here, it means the request never reached the server, as guaranteed
-                // by the 'send' function. Since the server did not receive the data, it is safe to retry
-                // the request.
                 RedisError::from((
                     crate::ErrorKind::FatalSendError,
                     "Failed to send the request to the server",
@@ -401,9 +398,6 @@ where
         match Runtime::locate().timeout(timeout, receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(err)) => {
-                // The `sender` was dropped, likely indicating a failure in the stream.
-                // This error suggests that it's unclear whether the server received the request before the connection failed,
-                // making it unsafe to retry. For example, retrying an INCR request could result in double increments.
                 Err(RedisError::from((
                     crate::ErrorKind::FatalReceiveError,
                     "Failed to receive a response due to a fatal error",

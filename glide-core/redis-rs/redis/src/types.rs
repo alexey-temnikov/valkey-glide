@@ -319,7 +319,7 @@ impl From<RedisError> for ServerError {
 
 impl From<tokio::time::error::Elapsed> for RedisError {
     fn from(_: tokio::time::error::Elapsed) -> Self {
-        RedisError::from((ErrorKind::IoError, "Operation timed out"))
+        RedisError::from(io::Error::new(io::ErrorKind::TimedOut, "Operation timed out"))
     }
 }
 
