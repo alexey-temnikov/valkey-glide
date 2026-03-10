@@ -145,10 +145,34 @@ where
             .map(|inner| {
                 let (tx, mut rx) = mpsc::unbounded_channel::<Message<_>>();
                 let stream = async move {
-                    let _ = stream::poll_fn(move |cx| rx.poll_recv(cx))
-                        .map(Ok)
-                        .forward(inner)
-                        .await;
+                    let mut sink = inner;
+                    loop {
+                        let msg = match rx.recv().await {
+                            Some(m) => m,
+                            None => break,
+                        };
+                        if sink.start_send_unpin(msg).is_err() {
+                            break;
+                        }
+                        while let Ok(msg) = rx.try_recv() {
+                            if sink.start_send_unpin(msg).is_err() {
+                                return;
+                            }
+                        }
+                        if futures::SinkExt::flush(&mut sink).await.is_err() {
+                            break;
+                        }
+                        // After recovery completes, drain any messages that arrived
+                        // during recovery and fail them immediately so callers don't
+                        // wait for the full try_request timeout.
+                        while let Ok(msg) = rx.try_recv() {
+                            let _ = msg.sender.send(Err(RedisError::from((
+                                ErrorKind::ClientError,
+                                "Connection in recovery",
+                            ))));
+                        }
+                    }
+                    let _ = futures::SinkExt::close(&mut sink).await;
                 };
                 #[cfg(feature = "tokio-comp")]
                 tokio::spawn(stream);
@@ -3401,55 +3425,53 @@ where
         cx: &mut task::Context,
     ) -> Poll<Result<(), Self::Error>> {
         trace!("poll_flush: {:?}", self.state);
-        loop {
-            self.send_refresh_error();
+        self.send_refresh_error();
 
-            if let Err(err) = ready!(self.as_mut().poll_recover(cx)) {
-                // We failed to reconnect, while we will try again we will report the
-                // error if we can to avoid getting trapped in an infinite loop of
-                // trying to reconnect
+        match self.as_mut().poll_recover(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(err)) => {
                 self.refresh_error = Some(err);
-
-                // Give other tasks a chance to progress before we try to recover
-                // again. Since the future may not have registered a wake up we do so
-                // now so the task is not forgotten
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
+            Poll::Ready(Ok(())) => {}
+        }
 
-            match ready!(self.poll_complete(cx)) {
-                PollFlushAction::None => return Poll::Ready(Ok(())),
-                PollFlushAction::RebuildSlots => {
-                    ClusterConnInner::fail_pending_requests(&self.inner);
-                    // Spawn refresh task
-                    let task_handle = ClusterConnInner::spawn_refresh_slots_task(
-                        self.inner.clone(),
-                        &RefreshPolicy::Throttable,
-                    );
-
-                    // Update state
-                    self.state =
-                        ConnectionState::Recover(RecoverFuture::RefreshingSlots(task_handle));
-                }
-                PollFlushAction::ReconnectFromInitialConnections => {
-                    ClusterConnInner::fail_pending_requests(&self.inner);
-                    self.state =
-                        ConnectionState::Recover(RecoverFuture::ReconnectToInitialNodes(Box::pin(
-                            ClusterConnInner::reconnect_to_initial_nodes(self.inner.clone()),
-                        )));
-                }
-                PollFlushAction::Reconnect(addresses) => {
-                    ClusterConnInner::fail_pending_requests(&self.inner);
-                    self.state = ConnectionState::Recover(RecoverFuture::Reconnect(Box::pin(
-                        ClusterConnInner::trigger_refresh_connection_tasks(
-                            self.inner.clone(),
-                            addresses,
-                            RefreshConnectionType::OnlyUserConnection,
-                            true,
-                        )
-                        .map(|_| ()), // Convert Vec<Arc<Notify>> to () as it's not needed here
+        match ready!(self.as_mut().poll_complete(cx)) {
+            PollFlushAction::None => Poll::Ready(Ok(())),
+            PollFlushAction::RebuildSlots => {
+                ClusterConnInner::fail_pending_requests(&self.inner);
+                let task_handle = ClusterConnInner::spawn_refresh_slots_task(
+                    self.inner.clone(),
+                    &RefreshPolicy::Throttable,
+                );
+                self.state =
+                    ConnectionState::Recover(RecoverFuture::RefreshingSlots(task_handle));
+                let _ = self.as_mut().poll_recover(cx);
+                Poll::Pending
+            }
+            PollFlushAction::ReconnectFromInitialConnections => {
+                ClusterConnInner::fail_pending_requests(&self.inner);
+                self.state =
+                    ConnectionState::Recover(RecoverFuture::ReconnectToInitialNodes(Box::pin(
+                        ClusterConnInner::reconnect_to_initial_nodes(self.inner.clone()),
                     )));
-                }
+                let _ = self.as_mut().poll_recover(cx);
+                Poll::Pending
+            }
+            PollFlushAction::Reconnect(addresses) => {
+                ClusterConnInner::fail_pending_requests(&self.inner);
+                self.state = ConnectionState::Recover(RecoverFuture::Reconnect(Box::pin(
+                    ClusterConnInner::trigger_refresh_connection_tasks(
+                        self.inner.clone(),
+                        addresses,
+                        RefreshConnectionType::OnlyUserConnection,
+                        true,
+                    )
+                    .map(|_| ()),
+                )));
+                let _ = self.as_mut().poll_recover(cx);
+                Poll::Pending
             }
         }
     }
