@@ -7,7 +7,11 @@ from typing import Any, List, Optional, Tuple, Union
 
 from glide_shared.commands.command_args import ObjectType
 from glide_shared.commands.core_options import PubSubMsg
-from glide_shared.config import BaseClientConfiguration
+from glide_shared.config import (
+    BaseClientConfiguration,
+    GlideClientConfiguration,
+    GlideClusterClientConfiguration,
+)
 from glide_shared.constants import OK, TEncodable, TResult
 from glide_shared.exceptions import (
     ClosingError,
@@ -29,7 +33,6 @@ from glide_shared.routes import (
 )
 
 from ._glide_ffi import _GlideFFI
-from .config import GlideClientConfiguration, GlideClusterClientConfiguration
 from .logger import Level, Logger
 from .sync_commands.cluster_commands import ClusterCommands
 from .sync_commands.cluster_scan_cursor import ClusterScanCursor
@@ -102,16 +105,13 @@ class BaseClient(CoreCommands):
             },
         )
 
-        if self._config._is_pubsub_configured():
-            # If in subscribed mode, create a callback that will be called by the FFI layer
-            # for handling push notifications. This callback would either call the user callback (if provided),
-            # or append the messaged to the the `_pubsub_queue`
-            python_callback = self._create_push_handle_callback()
-            pubsub_callback = self._ffi.callback("PubSubCallback", python_callback)
-            # Store reference to prevent garbage collection
-            self._pubsub_callback_ref = pubsub_callback
-        else:
-            pubsub_callback = self._ffi.cast("PubSubCallback", 0)
+        # Always create pubsub callback to support dynamic subscriptions
+        # This ensures messages are always handled by the wrapper, whether they originate
+        # from configured subscriptions or from dynamic subscriptions added at runtime
+        python_callback = self._create_push_handle_callback()
+        pubsub_callback = self._ffi.callback("PubSubCallback", python_callback)
+        # Store reference to prevent garbage collection
+        self._pubsub_callback_ref = pubsub_callback
 
         client_response_ptr = self._lib.create_client(
             conn_req_bytes,
@@ -334,7 +334,7 @@ class BaseClient(CoreCommands):
         for arg in args:
             if isinstance(arg, str):
                 arg_bytes = arg.encode(ENCODING)
-            elif isinstance(arg, bytes):
+            elif isinstance(arg, (bytes, bytearray, memoryview)):
                 arg_bytes = arg
             else:
                 raise TypeError(f"Unsupported argument type: {type(arg)}")
@@ -392,6 +392,7 @@ class BaseClient(CoreCommands):
         request_type: RequestType.ValueType,
         args: List[TEncodable],
         route: Optional[Route] = None,
+        response_buffer: Optional[memoryview] = None,
     ) -> TResult:
         if self._is_closed:
             raise ClosingError(
@@ -400,24 +401,54 @@ class BaseClient(CoreCommands):
         client_adapter_ptr = self._core_client
         if client_adapter_ptr == self._ffi.NULL:
             raise ValueError("Invalid client pointer.")
+        if response_buffer:
+            if response_buffer.readonly:
+                raise TypeError("response_buffer must be writable")
+            if not response_buffer.c_contiguous:
+                raise TypeError("response_buffer must be C-contiguous")
 
-        # Convert the arguments to C-compatible pointers
-        c_args, c_lengths, buffers = self._to_c_strings(args)
+        # Create span if OpenTelemetry is configured and sampling indicates we should trace
+        from .opentelemetry import OpenTelemetry
 
-        # Route bytes should be kept alive in the scope of the FFI call
-        route_ptr, route_len, route_bytes = self._to_c_route_ptr_and_len(route)
+        span = 0
+        span_name_cstr = None
+        if OpenTelemetry.should_sample():
+            from glide_shared.protobuf.command_request_pb2 import RequestType
 
-        result = self._lib.command(
-            client_adapter_ptr,  # Pointer to the ClientAdapter from create_client()
-            0,  # Request ID - placeholder for sync clients (used for async callbacks)
-            request_type,  # Request type (e.g., GET or SET)
-            len(args),  # Number of arguments
-            c_args,  # Array of argument pointers
-            c_lengths,  # Array of argument lengths
-            route_ptr,  # Pointer to protobuf-encoded routing information (NULL if no routing)
-            route_len,  # Length of the routing data in bytes (0 if no routing)
-            0,  # Span pointer (0 for no tracing)
-        )
+            command_name = RequestType.Name(request_type)
+            span_name_cstr = self._ffi.new("char[]", command_name.encode())
+            span = self._lib.create_named_otel_span(span_name_cstr)
+
+        try:
+            # Convert the arguments to C-compatible pointers
+            c_args, c_lengths, buffers = self._to_c_strings(args)
+
+            # Route bytes should be kept alive in the scope of the FFI call
+            route_ptr, route_len, route_bytes = self._to_c_route_ptr_and_len(route)
+
+            buf_ptr = (
+                self._ffi.from_buffer(response_buffer)
+                if response_buffer
+                else self._ffi.NULL
+            )
+            buf_len = len(response_buffer) if response_buffer else 0
+            result = self._lib.command_with_buffer(
+                client_adapter_ptr,
+                0,
+                request_type,
+                len(args),
+                c_args,
+                c_lengths,
+                route_ptr,
+                route_len,
+                buf_ptr,
+                buf_len,
+                span,
+            )
+        finally:
+            # Drop span if it was created
+            if span != 0:
+                self._lib.drop_otel_span(span)
         return self._handle_cmd_result(result)
 
     def _update_connection_password(
@@ -498,29 +529,41 @@ class BaseClient(CoreCommands):
         if client_adapter_ptr == self._ffi.NULL:
             raise ValueError("Invalid client pointer.")
 
-        # Note: batch_refs and option_refs must remain in scope
-        # throughout this entire function call to prevent garbage collection of Python objects
-        # that have C pointers pointing to them via ffi.from_buffer().
+        # Create span if OpenTelemetry is configured and sampling indicates we should trace
+        from .opentelemetry import OpenTelemetry
 
-        # Convert commands + atomic flag to C BatchInfo
-        batch_info, batch_refs = self._convert_commands_to_c_batch_info(
-            commands, is_atomic
-        )
+        span = 0
+        if OpenTelemetry.should_sample():
+            span = self._lib.create_batch_otel_span()
 
-        # Create batch options from extracted parameters
-        batch_options, option_refs = self._create_c_batch_options_from_params(
-            retry_server_error, retry_connection_error, route, timeout
-        )
+        try:
+            # Note: batch_refs and option_refs must remain in scope
+            # throughout this entire function call to prevent garbage collection of Python objects
+            # that have C pointers pointing to them via ffi.from_buffer().
 
-        result = self._lib.batch(
-            client_adapter_ptr,
-            0,  # callback_index (0 for sync)
-            batch_info,
-            raise_on_error,
-            batch_options,
-            0,  # span_ptr (not yet implemented in sync)
-        )
-        return self._handle_cmd_result(result)
+            # Convert commands + atomic flag to C BatchInfo
+            batch_info, batch_refs = self._convert_commands_to_c_batch_info(
+                commands, is_atomic
+            )
+
+            # Create batch options from extracted parameters
+            batch_options, option_refs = self._create_c_batch_options_from_params(
+                retry_server_error, retry_connection_error, route, timeout
+            )
+
+            result = self._lib.batch(
+                client_adapter_ptr,
+                0,  # callback_index (0 for sync)
+                batch_info,
+                raise_on_error,
+                batch_options,
+                span,  # span_ptr for tracing
+            )
+            return self._handle_cmd_result(result)
+        finally:
+            # Drop span if it was created
+            if span != 0:
+                self._lib.drop_otel_span(span)
 
     def _convert_commands_to_c_batch_info(
         self,
@@ -549,7 +592,7 @@ class BaseClient(CoreCommands):
             for arg in args:
                 if isinstance(arg, str):
                     arg_bytes = arg.encode(ENCODING)
-                elif isinstance(arg, bytes):
+                elif isinstance(arg, (bytes, bytearray, memoryview)):
                     arg_bytes = arg
                 else:
                     raise TypeError(f"Unsupported argument type: {type(arg)}")
@@ -737,11 +780,6 @@ class BaseClient(CoreCommands):
                 "Unable to execute requests; the client is closed. Please create a new client."
             )
 
-        if not self._config._is_pubsub_configured():
-            raise ConfigurationError(
-                "The operation will never succeed since there was no pubsbub subscriptions applied to the client."
-            )
-
         if self._config._get_pubsub_callback_and_context()[0] is not None:
             raise ConfigurationError(
                 "The operation will never succeed since messages will be passed to the configured callback."
@@ -759,9 +797,6 @@ class BaseClient(CoreCommands):
             raise ClosingError(
                 "Unable to execute requests; the client is closed. Please create a new client."
             )
-
-        if not self._config._is_pubsub_configured():
-            raise ConfigurationError("No pubsub subscriptions configured")
 
         if self._config._get_pubsub_callback_and_context()[0] is not None:
             raise ConfigurationError(
@@ -792,6 +827,8 @@ class BaseClient(CoreCommands):
                 - total_bytes_compressed: Total bytes after compression
                 - total_bytes_decompressed: Total bytes after decompression
                 - compression_skipped_count: Number of times compression was skipped
+                - subscription_out_of_sync_count: Failed reconciliation attempts
+                - subscription_last_sync_timestamp: Last successful sync (milliseconds since epoch)
         """
         # Call the C FFI get_statistics function (returns by value, no manual free needed)
         stats = self._lib.get_statistics()
@@ -806,7 +843,64 @@ class BaseClient(CoreCommands):
             "total_bytes_compressed": stats.total_bytes_compressed,
             "total_bytes_decompressed": stats.total_bytes_decompressed,
             "compression_skipped_count": stats.compression_skipped_count,
+            "subscription_out_of_sync_count": stats.subscription_out_of_sync_count,
+            "subscription_last_sync_timestamp": stats.subscription_last_sync_timestamp,
         }
+
+    def get_subscriptions(self):
+        """Get subscription state (desired vs actual)."""
+        result = self._execute_command(RequestType.GetSubscriptions, [])
+        return self._parse_pubsub_state(
+            result, is_cluster=isinstance(self, GlideClusterClient)
+        )
+
+    def _parse_pubsub_state(self, result, is_cluster):
+        """Parse subscription state from Rust response."""
+        if not isinstance(result, list) or len(result) != 4:
+            raise RequestError("Invalid response format from GetSubscriptions")
+
+        desired_dict = result[1]
+        actual_dict = result[3]
+
+        if is_cluster:
+            from glide_shared.config import GlideClusterClientConfiguration
+
+            PubSubChannelModes = GlideClusterClientConfiguration.PubSubChannelModes
+            StateClass = GlideClusterClientConfiguration.PubSubState
+            mode_map = {
+                "Exact": PubSubChannelModes.Exact,
+                "Pattern": PubSubChannelModes.Pattern,
+                "Sharded": PubSubChannelModes.Sharded,
+            }
+        else:
+            from glide_shared.config import GlideClientConfiguration
+
+            PubSubChannelModes = GlideClientConfiguration.PubSubChannelModes
+            StateClass = GlideClientConfiguration.PubSubState
+            mode_map = {
+                "Exact": PubSubChannelModes.Exact,
+                "Pattern": PubSubChannelModes.Pattern,
+            }
+
+        desired_subscriptions = {}
+        actual_subscriptions = {}
+
+        for key_bytes, value_list in desired_dict.items():
+            key = key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes
+            if key in mode_map:
+                values = {v.decode() if isinstance(v, bytes) else v for v in value_list}
+                desired_subscriptions[mode_map[key]] = values
+
+        for key_bytes, value_list in actual_dict.items():
+            key = key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes
+            if key in mode_map:
+                values = {v.decode() if isinstance(v, bytes) else v for v in value_list}
+                actual_subscriptions[mode_map[key]] = values
+
+        return StateClass(
+            desired_subscriptions=desired_subscriptions,
+            actual_subscriptions=actual_subscriptions,
+        )
 
     def close(self):
         if not self._is_closed:
@@ -822,7 +916,7 @@ class GlideClusterClient(BaseClient, ClusterCommands):
     """
     Client used for connection to cluster servers.
     For full documentation, see
-    https://github.com/valkey-io/valkey-glide/wiki/Python-wrapper#cluster
+    https://glide.valkey.io/how-to/client-initialization/#cluster
     """
 
     def _build_cluster_scan_args(self, match, count, type, allow_non_covered_slots):
@@ -910,7 +1004,7 @@ class GlideClient(BaseClient, StandaloneCommands):
     """
     Client used for connection to standalone servers.
     For full documentation, see
-    https://github.com/valkey-io/valkey-glide/wiki/Python-wrapper#standalone
+    https://glide.valkey.io/how-to/client-initialization/#standalone
     """
 
 

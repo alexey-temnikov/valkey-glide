@@ -47,12 +47,16 @@ For developers, please refer to Java's [DEVELOPER.md](./DEVELOPER.md) for furthe
 
 **Java Requirements**
 
-Minimum requirements: JDK 11 or later. Ensure that you have a minimum Java version of JDK 11 installed on your system:
+Minimum requirements: JDK 8 or later. However, **JDK 11 or later is strongly recommended** as Java 8 no longer receives free security updates.
+
+Ensure that you have Java installed on your system:
 
 ```bash
 echo $JAVA_HOME
 java -version
 ```
+
+**Note:** While Java 8 is supported for compatibility with legacy applications, we strongly recommend using JDK 11 or later for production deployments due to ongoing security support.
 
 ### Adding the client to your project
 
@@ -341,6 +345,98 @@ public class Main {
             e.printStackTrace();
         }
     }
+}
+```
+
+## PubSub Configuration and Monitoring
+
+### Dynamic PubSub with Reconciliation
+
+Valkey GLIDE supports dynamic PubSub with automatic subscription reconciliation. Configure the reconciliation interval to ensure subscriptions remain synchronized:
+
+```java
+import glide.api.GlideClient;
+import glide.api.models.configuration.GlideClientConfiguration;
+import glide.api.models.configuration.AdvancedGlideClientConfiguration;
+import glide.api.models.configuration.NodeAddress;
+
+GlideClientConfiguration config = GlideClientConfiguration.builder()
+    .address(NodeAddress.builder().host("localhost").port(6379).build())
+    .advancedConfig(
+        AdvancedGlideClientConfiguration.builder()
+            .pubsubReconciliationIntervalMs(5000) // Reconcile every 5 seconds
+            .build()
+    )
+    .build();
+
+try (GlideClient client = GlideClient.createClient(config).get()) {
+    // Subscribe to channels dynamically
+    client.subscribe(Set.of("news", "updates")).get();
+
+    // Get subscription state
+    var state = client.getSubscriptions().get();
+    System.out.println("Desired subscriptions: " + state.desiredSubscriptions);
+    System.out.println("Actual subscriptions: " + state.actualSubscriptions);
+
+    // Unsubscribe
+    client.unsubscribe(Set.of("news")).get();
+}
+```
+
+### Monitoring Subscription Health
+
+Monitor subscription health and reconciliation status using `getStatistics()`:
+
+```java
+try (GlideClient client = GlideClient.createClient(config).get()) {
+    // Subscribe to channels
+    client.subscribe(Set.of("channel1", "channel2")).get();
+
+    // Get statistics
+    Map<String, String> stats = client.getStatistics();
+
+    // Available metrics:
+    // - total_connections: Number of active connections
+    // - total_clients: Number of client instances
+    // - total_values_compressed: Count of compressed values
+    // - total_values_decompressed: Count of decompressed values
+    // - total_original_bytes: Original data size before compression
+    // - total_bytes_compressed: Compressed data size
+    // - total_bytes_decompressed: Decompressed data size
+    // - compression_skipped_count: Times compression was skipped
+    // - subscription_out_of_sync_count: Failed reconciliation attempts
+    // - subscription_last_sync_timestamp: Last successful sync (milliseconds since epoch)
+
+    System.out.println("Out of sync count: " + stats.get("subscription_out_of_sync_count"));
+    System.out.println("Last sync timestamp: " + stats.get("subscription_last_sync_timestamp"));
+}
+```
+
+### Sharded PubSub (Cluster Mode, Redis 7.0+)
+
+For cluster mode, you can use sharded PubSub channels:
+
+```java
+import glide.api.GlideClusterClient;
+import glide.api.models.configuration.GlideClusterClientConfiguration;
+
+GlideClusterClientConfiguration config = GlideClusterClientConfiguration.builder()
+    .address(NodeAddress.builder().host("localhost").port(7001).build())
+    .advancedConfig(
+        AdvancedGlideClusterClientConfiguration.builder()
+            .pubsubReconciliationIntervalMs(5000)
+            .build()
+    )
+    .build();
+
+try (GlideClusterClient client = GlideClusterClient.createClient(config).get()) {
+    // Subscribe to sharded channels
+    client.ssubscribe(Set.of("shard-channel-1", "shard-channel-2")).get();
+
+    // Get subscription state
+    var state = client.getSubscriptions().get();
+    System.out.println("Sharded subscriptions: " +
+        state.actualSubscriptions.get(PubSubChannelMode.Sharded));
 }
 ```
 

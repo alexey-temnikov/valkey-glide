@@ -228,7 +228,7 @@ python/
 **Packages:** `valkey-glide` (async), `valkey-glide-sync` (sync) on PyPI
 **API Styles:** Async (asyncio/trio), Sync (blocking)
 **Client Types:** GlideClient (standalone), GlideClusterClient (cluster) for both async/sync
-**Key Features:** Dual client architecture, shared logic, multi-async framework support
+**Key Features:** Dual client architecture, shared logic, multi-async framework support, OpenTelemetry observability
 **Testing:** pytest with async backend selection, shared test suite
 **Platforms:** Linux (Ubuntu, AL2/AL2023), macOS (Intel/Apple Silicon)
 **Dependencies:** Python 3.9+, Rust toolchain, protobuf compiler
@@ -239,7 +239,7 @@ python/
 - **Development Setup:** [DEVELOPER.md](./DEVELOPER.md)
 - **Examples:** [../examples/python/](../examples/python/)
 - **API Documentation:** [Valkey GLIDE Python docs](https://valkey.io/valkey-glide/)
-- **Wiki:** [Python wrapper wiki](https://github.com/valkey-io/valkey-glide/wiki/Python-wrapper)
+- **Documentation:** [GLIDE Documentation](https://glide.valkey.io/)
 - **Test Suites:** [tests/](./tests/) directory
 - **Async Client:** [glide-async/](./glide-async/) directory
 - **Sync Client:** [glide-sync/](./glide-sync/) directory

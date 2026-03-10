@@ -6,6 +6,8 @@ from typing import Generator, List, Optional
 import pytest
 from glide_shared.config import (
     BackoffStrategy,
+    GlideClientConfiguration,
+    GlideClusterClientConfiguration,
     NodeAddress,
     ProtocolVersion,
     ReadFrom,
@@ -15,11 +17,11 @@ from glide_shared.exceptions import ClosingError
 from glide_sync import GlideClient as SyncGlideClient
 from glide_sync import GlideClusterClient as SyncGlideClusterClient
 from glide_sync import TGlideClient as TSyncGlideClient
-from glide_sync.config import GlideClientConfiguration, GlideClusterClientConfiguration
 from glide_sync.logger import Level as LogLevel
 from glide_sync.logger import Logger
 
 from tests.utils.cluster import ValkeyCluster
+from tests.utils.pubsub_test_utils import sync_pubsub_test_clients  # noqa: F401
 from tests.utils.utils import (
     DEFAULT_SYNC_TEST_LOG_LEVEL,
     INITIAL_PASSWORD,
@@ -112,15 +114,15 @@ def acl_glide_sync_client(
 
 
 def create_sync_client(
-    request,
-    cluster_mode: bool,
+    request=None,
+    cluster_mode: bool = False,
     credentials: Optional[ServerCredentials] = None,
     database_id: int = 0,
     addresses: Optional[List[NodeAddress]] = None,
     client_name: Optional[str] = None,
     protocol: ProtocolVersion = ProtocolVersion.RESP3,
     request_timeout: Optional[int] = 1000,
-    connection_timeout: Optional[int] = 1000,
+    connection_timeout: Optional[int] = 10000,  # 10 seconds for test client creation
     cluster_mode_pubsub: Optional[
         GlideClusterClientConfiguration.PubSubSubscriptions
     ] = None,
@@ -135,6 +137,12 @@ def create_sync_client(
     tls_insecure: Optional[bool] = None,
     lazy_connect: Optional[bool] = False,
     enable_compression: Optional[bool] = None,
+    inflight_requests_limit: Optional[int] = None,
+    reconciliation_interval_ms: Optional[int] = None,
+    root_pem_cacerts: Optional[bytes] = None,
+    client_cert_pem: Optional[bytes] = None,
+    client_key_pem: Optional[bytes] = None,
+    read_only: bool = False,
 ) -> TSyncGlideClient:
     # Create sync client
     config = create_sync_client_config(
@@ -157,6 +165,12 @@ def create_sync_client(
         tls_insecure=tls_insecure,
         lazy_connect=lazy_connect,
         enable_compression=enable_compression,
+        inflight_requests_limit=inflight_requests_limit,
+        reconciliation_interval_ms=reconciliation_interval_ms,
+        root_pem_cacerts=root_pem_cacerts,
+        client_cert_pem=client_cert_pem,
+        client_key_pem=client_key_pem,
+        read_only=read_only,
     )
     if cluster_mode:
         return SyncGlideClusterClient.create(config)

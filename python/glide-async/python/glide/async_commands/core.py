@@ -1778,7 +1778,7 @@ class CoreCommands(Protocol):
         Note:
             1. When in cluster mode, all `keys` must map to the same hash slot.
             2. `BLPOP` is a client blocking command, see
-               [blocking commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands)
+               [blocking commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands)
                for more details and best practices.
 
         Args:
@@ -1857,7 +1857,7 @@ class CoreCommands(Protocol):
         Note:
             1. When in cluster mode, all `keys` must map to the same hash slot.
             2. `BLMPOP` is a client blocking command, see
-               [blocking commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands)
+               [blocking commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands)
                for more details and best practices.
 
         See [valkey.io](https://valkey.io/commands/blmpop/) for details.
@@ -2104,7 +2104,7 @@ class CoreCommands(Protocol):
         Notes:
             1. When in cluster mode, all `keys` must map to the same hash slot.
             2. `BRPOP` is a client blocking command, see
-               [blocking commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands)
+               [blocking commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands)
                for more details and best practices.
 
         Args:
@@ -2230,7 +2230,7 @@ class CoreCommands(Protocol):
         Notes:
             1. When in cluster mode, both `source` and `destination` must map to the same hash slot.
             2. `BLMOVE` is a client blocking command, see
-               [blocking commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands)
+               [blocking commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands)
                for more details and best practices.
 
         See [valkey.io](https://valkey.io/commands/blmove/) for details.
@@ -4986,7 +4986,7 @@ class CoreCommands(Protocol):
             1. When in cluster mode, all keys must map to the same hash slot.
             2. `BZPOPMAX` is the blocking variant of `ZPOPMAX`.
             3. `BZPOPMAX` is a client blocking command, see
-               [blocking commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands)
+               [blocking commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands)
                for more details and best practices.
 
         See [valkey.io](https://valkey.io/commands/bzpopmax) for more details.
@@ -5059,7 +5059,7 @@ class CoreCommands(Protocol):
             1. When in cluster mode, all keys must map to the same hash slot.
             2. `BZPOPMIN` is the blocking variant of `ZPOPMIN`.
             3. `BZPOPMIN` is a client blocking command, see
-               [blocking commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands)
+               [blocking commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands)
                for more details and best practices.
 
         See [valkey.io](https://valkey.io/commands/bzpopmin) for more details.
@@ -6141,7 +6141,7 @@ class CoreCommands(Protocol):
         Notes:
             1. When in cluster mode, all `keys` must map to the same hash slot.
             2. `BZMPOP` is a client blocking command, see
-               [blocking commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands)
+               [blocking commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands)
                for more details and best practices.
 
         Args:
@@ -7858,6 +7858,7 @@ class CoreCommands(Protocol):
 
         Raises:
             TimeoutError: If timeout > 0 and server confirmation not received within timeout.
+            ValueError: If timeout_ms is negative.
 
         Examples:
             >>> await client.subscribe({"channel1"})
@@ -7867,6 +7868,8 @@ class CoreCommands(Protocol):
             >>> await client.subscribe({"channel1", "channel2"}, timeout=5.0)
             >>> print("Subscribed successfully within 5 seconds")
         """
+        if timeout_ms < 0:
+            raise ValueError(f"Timeout must be non-negative, got: {timeout_ms}")
         args = list(channels) + [str(timeout_ms)]
         await self._execute_command(RequestType.SubscribeBlocking, list(args))
 
@@ -7911,6 +7914,7 @@ class CoreCommands(Protocol):
 
         Raises:
             TimeoutError: If timeout > 0 and server confirmation not received within timeout.
+            ValueError: If timeout_ms is negative.
 
         Examples:
             >>> await client.psubscribe({"news.*"})
@@ -7920,6 +7924,8 @@ class CoreCommands(Protocol):
             >>> await client.psubscribe({"news.*", "updates.*"}, timeout=10.0)
             >>> print("Subscribed to patterns successfully within 10 seconds")
         """
+        if timeout_ms < 0:
+            raise ValueError(f"Timeout must be non-negative, got: {timeout_ms}")
         args = list(patterns) + [str(timeout_ms)]
         await self._execute_command(RequestType.PSubscribeBlocking, list(args))
 
@@ -7957,31 +7963,40 @@ class CoreCommands(Protocol):
         """
         Unsubscribe from exact channels (blocking).
 
-        This command updates the client's internal desired subscription state and waits
-        for server confirmation.
+        This command updates the client's internal desired subscription state
+        and waits for server confirmation.
 
         Args:
             channels: A set of channel names to unsubscribe from.
-                    If None, unsubscribes from all exact channels.
-            timeout_ms: Maximum time in milliseconds to wait for server confirmation.
-                    A value of 0 blocks indefinitely until confirmation.
+                    If None or ALL_CHANNELS, unsubscribes from all exact
+                    channels.
+            timeout_ms: Maximum time in milliseconds to wait for server
+                    confirmation. A value of 0 blocks indefinitely until
+                    confirmation.
 
         Return: None
 
         Raises:
             TimeoutError: If timeout > 0 and server confirmation not received within timeout.
+            ValueError: If timeout_ms is negative.
 
         Examples:
             >>> await client.unsubscribe({"channel1"})
             >>> print("Unsubscribed successfully (waited indefinitely)")
             >>>
             >>> # With timeout
-            >>> await client.unsubscribe({"channel1"}, timeout=5.0)
+            >>> await client.unsubscribe({"channel1"}, timeout_ms=5000)
             >>> print("Unsubscribed successfully within 5 seconds")
+            >>>
+            >>> # Unsubscribe from all exact channels with timeout
+            >>> from glide.async_commands.core import ALL_CHANNELS
+            >>> await client.unsubscribe(ALL_CHANNELS, timeout_ms=10000)
             >>>
             >>> # Unsubscribe from all exact channels with timeout
             >>> await client.unsubscribe(timeout=10.0)
         """
+        if timeout_ms < 0:
+            raise ValueError(f"Timeout must be non-negative, got: {timeout_ms}")
         args = (list(channels) if channels else []) + [str(timeout_ms)]
         await self._execute_command(RequestType.UnsubscribeBlocking, list(args))
 
@@ -8018,30 +8033,35 @@ class CoreCommands(Protocol):
         """
         Unsubscribe from channel patterns (blocking).
 
-        This command updates the client's internal desired subscription state and waits
-        for server confirmation.
+        This command updates the client's internal desired subscription state
+        and waits for server confirmation.
 
         Args:
             patterns: A set of patterns to unsubscribe from.
-                    If None, unsubscribes from all patterns.
-            timeout_ms: Maximum time in milliseconds to wait for server confirmation.
-                    A value of 0 blocks indefinitely until confirmation.
+                    If None or ALL_PATTERNS, unsubscribes from all patterns.
+            timeout_ms: Maximum time in milliseconds to wait for server
+                    confirmation. A value of 0 blocks indefinitely until
+                    confirmation.
 
         Return: None
 
         Raises:
-            TimeoutError: If timeout > 0 and server confirmation not received within timeout.
+            TimeoutError: If timeout > 0 and server confirmation not received
+                    within timeout.
 
         Examples:
             >>> await client.punsubscribe({"news.*"})
-            >>> print("Unsubscribed from pattern successfully (waited indefinitely)")
+            >>> print("Unsubscribed from pattern successfully")
             >>>
             >>> # With timeout
-            >>> await client.punsubscribe({"news.*"}, timeout=5.0)
-            >>> print("Unsubscribed from pattern successfully within 5 seconds")
+            >>> await client.punsubscribe({"news.*"}, timeout_ms=5000)
+            >>> print("Unsubscribed from pattern successfully")
             >>>
             >>> # Unsubscribe from all patterns with timeout
-            >>> await client.punsubscribe(timeout=10.0)
+            >>> from glide.async_commands.core import ALL_PATTERNS
+            >>> await client.punsubscribe(ALL_PATTERNS, timeout_ms=10000)
         """
+        if timeout_ms < 0:
+            raise ValueError(f"Timeout must be non-negative, got: {timeout_ms}")
         args = (list(patterns) if patterns else []) + [str(timeout_ms)]
         await self._execute_command(RequestType.PUnsubscribeBlocking, list(args))

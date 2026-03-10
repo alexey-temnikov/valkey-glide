@@ -3,11 +3,16 @@ package glide.api;
 
 import static command_request.CommandRequestOuterClass.RequestType.ClientGetName;
 import static command_request.CommandRequestOuterClass.RequestType.ClientId;
+import static command_request.CommandRequestOuterClass.RequestType.ClusterInfo;
+import static command_request.CommandRequestOuterClass.RequestType.ClusterLinks;
+import static command_request.CommandRequestOuterClass.RequestType.ClusterMyId;
+import static command_request.CommandRequestOuterClass.RequestType.ClusterMyShardId;
+import static command_request.CommandRequestOuterClass.RequestType.ClusterNodes;
+import static command_request.CommandRequestOuterClass.RequestType.ClusterShards;
 import static command_request.CommandRequestOuterClass.RequestType.ConfigGet;
 import static command_request.CommandRequestOuterClass.RequestType.ConfigResetStat;
 import static command_request.CommandRequestOuterClass.RequestType.ConfigRewrite;
 import static command_request.CommandRequestOuterClass.RequestType.ConfigSet;
-import static command_request.CommandRequestOuterClass.RequestType.CustomCommand;
 import static command_request.CommandRequestOuterClass.RequestType.DBSize;
 import static command_request.CommandRequestOuterClass.RequestType.Echo;
 import static command_request.CommandRequestOuterClass.RequestType.FCall;
@@ -22,7 +27,9 @@ import static command_request.CommandRequestOuterClass.RequestType.FunctionList;
 import static command_request.CommandRequestOuterClass.RequestType.FunctionLoad;
 import static command_request.CommandRequestOuterClass.RequestType.FunctionRestore;
 import static command_request.CommandRequestOuterClass.RequestType.FunctionStats;
+import static command_request.CommandRequestOuterClass.RequestType.GetSubscriptions;
 import static command_request.CommandRequestOuterClass.RequestType.Info;
+import static command_request.CommandRequestOuterClass.RequestType.Keys;
 import static command_request.CommandRequestOuterClass.RequestType.LastSave;
 import static command_request.CommandRequestOuterClass.RequestType.Lolwut;
 import static command_request.CommandRequestOuterClass.RequestType.Ping;
@@ -30,6 +37,10 @@ import static command_request.CommandRequestOuterClass.RequestType.PubSubShardCh
 import static command_request.CommandRequestOuterClass.RequestType.PubSubShardNumSub;
 import static command_request.CommandRequestOuterClass.RequestType.RandomKey;
 import static command_request.CommandRequestOuterClass.RequestType.SPublish;
+import static command_request.CommandRequestOuterClass.RequestType.SSubscribe;
+import static command_request.CommandRequestOuterClass.RequestType.SSubscribeBlocking;
+import static command_request.CommandRequestOuterClass.RequestType.SUnsubscribe;
+import static command_request.CommandRequestOuterClass.RequestType.SUnsubscribeBlocking;
 import static command_request.CommandRequestOuterClass.RequestType.ScriptExists;
 import static command_request.CommandRequestOuterClass.RequestType.ScriptFlush;
 import static command_request.CommandRequestOuterClass.RequestType.ScriptKill;
@@ -37,6 +48,7 @@ import static command_request.CommandRequestOuterClass.RequestType.Select;
 import static command_request.CommandRequestOuterClass.RequestType.Time;
 import static command_request.CommandRequestOuterClass.RequestType.UnWatch;
 import static command_request.CommandRequestOuterClass.RequestType.Wait;
+import static command_request.CommandRequestOuterClass.RequestType.WaitAof;
 import static glide.api.commands.ServerManagementCommands.VERSION_VALKEY_API;
 import static glide.api.models.GlideString.gs;
 import static glide.api.models.commands.function.FunctionListOptions.LIBRARY_NAME_VALKEY_API;
@@ -47,6 +59,7 @@ import static glide.utils.ArrayTransformUtils.castMapOfArrays;
 import static glide.utils.ArrayTransformUtils.concatenateArrays;
 import static glide.utils.ArrayTransformUtils.convertMapToKeyValueStringArray;
 
+import glide.api.commands.ClusterManagementClusterCommands;
 import glide.api.commands.ConnectionManagementClusterCommands;
 import glide.api.commands.GenericClusterCommands;
 import glide.api.commands.PubSubClusterCommands;
@@ -70,6 +83,8 @@ import glide.api.models.commands.scan.ScanOptions;
 import glide.api.models.configuration.BaseClientConfiguration;
 import glide.api.models.configuration.ClusterSubscriptionConfiguration;
 import glide.api.models.configuration.GlideClusterClientConfiguration;
+import glide.api.models.configuration.PubSubState;
+import glide.api.models.configuration.PubSubStateImpl;
 import glide.api.models.configuration.RequestRoutingConfiguration.Route;
 import glide.api.models.configuration.RequestRoutingConfiguration.SimpleSingleNodeRoute;
 import glide.api.models.configuration.RequestRoutingConfiguration.SingleNodeRoute;
@@ -78,11 +93,12 @@ import glide.ffi.resolvers.ClusterScanCursorResolver;
 import glide.managers.CommandManager;
 import glide.utils.ArgsBuilder;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -94,8 +110,8 @@ import response.ResponseOuterClass.Response;
  * Use {@link #createClient} to request a client.
  *
  * @see For full documentation refer to <a
- *     href="https://github.com/valkey-io/valkey-glide/wiki/Java-Wrapper#cluster">Valkey Glide
- *     Wiki</a>.
+ *     href="https://glide.valkey.io/how-to/client-initialization/#cluster">Valkey GLIDE
+ *     Documentation</a>.
  */
 public class GlideClusterClient extends BaseClient
         implements ConnectionManagementClusterCommands,
@@ -103,7 +119,8 @@ public class GlideClusterClient extends BaseClient
                 ServerManagementClusterCommands,
                 ScriptingAndFunctionsClusterCommands,
                 TransactionsClusterCommands,
-                PubSubClusterCommands {
+                PubSubClusterCommands,
+                ClusterManagementClusterCommands {
 
     /** Constructor using ClientParams from BaseClient. */
     protected GlideClusterClient(ClientBuilder builder) {
@@ -165,31 +182,29 @@ public class GlideClusterClient extends BaseClient
     @Override
     public CompletableFuture<ClusterValue<Object>> customCommand(@NonNull String[] args) {
         // TODO if a command returns a map as a single value, ClusterValue misleads user
-        return commandManager.submitNewCommand(
-                CustomCommand, args, response -> ClusterValue.of(handleObjectOrNullResponse(response)));
+        return commandManager.submitCustomCommand(
+                args, response -> ClusterValue.of(handleObjectOrNullResponse(response)));
     }
 
     @Override
     public CompletableFuture<ClusterValue<Object>> customCommand(@NonNull GlideString[] args) {
         // TODO if a command returns a map as a single value, ClusterValue misleads user
-        return commandManager.submitNewCommand(
-                CustomCommand,
-                args,
-                response -> ClusterValue.of(handleBinaryObjectOrNullResponse(response)));
+        return commandManager.submitCustomCommand(
+                args, response -> ClusterValue.of(handleBinaryObjectOrNullResponse(response)));
     }
 
     @Override
     public CompletableFuture<ClusterValue<Object>> customCommand(
             @NonNull String[] args, @NonNull Route route) {
-        return commandManager.submitNewCommand(
-                CustomCommand, args, route, response -> handleCustomCommandResponse(route, response));
+        return commandManager.submitCustomCommand(
+                args, route, response -> handleCustomCommandResponse(route, response));
     }
 
     @Override
     public CompletableFuture<ClusterValue<Object>> customCommand(
             @NonNull GlideString[] args, @NonNull Route route) {
-        return commandManager.submitNewCommand(
-                CustomCommand, args, route, response -> handleCustomCommandBinaryResponse(route, response));
+        return commandManager.submitCustomCommand(
+                args, route, response -> handleCustomCommandBinaryResponse(route, response));
     }
 
     @SuppressWarnings("unchecked")
@@ -200,7 +215,7 @@ public class GlideClusterClient extends BaseClient
         if (response.hasConstantResponse()) {
             return ClusterValue.ofSingleValue(handleStringResponse(response));
         }
-        var data =
+        Object data =
                 handleValkeyResponse(Object.class, EnumSet.of(ResponseFlags.ENCODING_UTF8), response);
         if (data instanceof Map) {
             return ClusterValue.ofMultiValue((Map<String, Object>) data);
@@ -216,7 +231,7 @@ public class GlideClusterClient extends BaseClient
         if (response.hasConstantResponse()) {
             return ClusterValue.ofSingleValue(handleStringResponse(response));
         }
-        var data = handleValkeyResponse(Object.class, EnumSet.noneOf(ResponseFlags.class), response);
+        Object data = handleValkeyResponse(Object.class, EnumSet.noneOf(ResponseFlags.class), response);
         if (data instanceof Map) {
             return ClusterValue.ofMultiValueBinary((Map<GlideString, Object>) data);
         }
@@ -703,7 +718,7 @@ public class GlideClusterClient extends BaseClient
             // each `Object` is a `Map<String, Object>[]` actually
             Map<String, Object> info = handleMapResponse(response);
             Map<String, Map<String, Object>[]> data = new LinkedHashMap<>();
-            for (var nodeInfo : info.entrySet()) {
+            for (Map.Entry<String, Object> nodeInfo : info.entrySet()) {
                 data.put(nodeInfo.getKey(), handleFunctionListResponse((Object[]) nodeInfo.getValue()));
             }
             return ClusterValue.ofMultiValue(data);
@@ -721,7 +736,7 @@ public class GlideClusterClient extends BaseClient
             // each `Object` is a `Map<GlideString, Object>[]` actually
             Map<GlideString, Object> info = handleBinaryStringMapResponse(response);
             Map<GlideString, Map<GlideString, Object>[]> data = new LinkedHashMap<>();
-            for (var nodeInfo : info.entrySet()) {
+            for (Map.Entry<GlideString, Object> nodeInfo : info.entrySet()) {
                 data.put(
                         nodeInfo.getKey(), handleFunctionListResponseBinary((Object[]) nodeInfo.getValue()));
             }
@@ -1058,10 +1073,10 @@ public class GlideClusterClient extends BaseClient
     public CompletableFuture<Object> invokeScript(@NonNull Script script, @NonNull Route route) {
         if (script.getBinaryOutput()) {
             return commandManager.submitScript(
-                    script, List.of(), route, this::handleBinaryObjectOrNullResponse);
+                    script, Collections.emptyList(), route, this::handleBinaryObjectOrNullResponse);
         } else {
             return commandManager.submitScript(
-                    script, List.of(), route, this::handleObjectOrNullResponse);
+                    script, Collections.emptyList(), route, this::handleObjectOrNullResponse);
         }
     }
 
@@ -1305,10 +1320,63 @@ public class GlideClusterClient extends BaseClient
     }
 
     @Override
+    public CompletableFuture<ClusterValue<String[]>> keys(String pattern) {
+        return commandManager.submitNewCommand(
+                Keys,
+                new String[] {pattern},
+                response ->
+                        ClusterValue.ofSingleValue(castArray(handleArrayResponse(response), String.class)));
+    }
+
+    @Override
+    public CompletableFuture<ClusterValue<GlideString[]>> keys(GlideString pattern) {
+        return commandManager.submitNewCommand(
+                Keys,
+                new GlideString[] {pattern},
+                response ->
+                        ClusterValue.ofSingleValue(
+                                castArray(handleArrayResponseBinary(response), GlideString.class)));
+    }
+
+    @Override
+    public CompletableFuture<ClusterValue<String[]>> keys(String pattern, @NonNull Route route) {
+        return commandManager.submitNewCommand(
+                Keys,
+                new String[] {pattern},
+                route,
+                response ->
+                        ClusterValue.ofSingleValue(castArray(handleArrayResponse(response), String.class)));
+    }
+
+    @Override
+    public CompletableFuture<ClusterValue<GlideString[]>> keys(
+            GlideString pattern, @NonNull Route route) {
+        return commandManager.submitNewCommand(
+                Keys,
+                new GlideString[] {pattern},
+                route,
+                response ->
+                        ClusterValue.ofSingleValue(
+                                castArray(handleArrayResponseBinary(response), GlideString.class)));
+    }
+
+    @Override
     public CompletableFuture<Long> wait(long numreplicas, long timeout) {
         String[] arguments = new String[] {Long.toString(numreplicas), Long.toString(timeout)};
-        return commandManager.submitNewCommand(
+        return commandManager.submitBlockingCommand(
                 Wait, arguments, SimpleSingleNodeRoute.RANDOM, this::handleLongResponse);
+    }
+
+    @Override
+    public CompletableFuture<Long[]> waitaof(
+            long numlocal, long numreplicas, long timeout, @NonNull Route route) {
+        String[] arguments =
+                new String[] {Long.toString(numlocal), Long.toString(numreplicas), Long.toString(timeout)};
+        return commandManager.submitBlockingCommand(
+                WaitAof,
+                arguments,
+                route,
+                response -> castArray(handleArrayResponse(response), Long.class));
     }
 
     /**
@@ -1412,5 +1480,337 @@ public class GlideClusterClient extends BaseClient
                 }
             }
         }
+    }
+
+    /**
+     * Subscribes the client to the specified sharded channels and doesn't wait for confirmation.
+     *
+     * <p>Sharded pubsub (available in Redis 7.0+) allows messages to be published to specific cluster
+     * shards, reducing overhead compared to cluster-wide pubsub.
+     *
+     * @param channels A set of sharded channel names to subscribe to
+     * @return A {@link CompletableFuture} that completes when the subscription request is processed
+     * @example
+     *     <pre>{@code
+     * client.ssubscribe(Set.of("shard-news", "shard-updates")).get();
+     * }</pre>
+     *
+     * @see <a href="https://valkey.io/commands/ssubscribe/">valkey.io</a> for details
+     */
+    public CompletableFuture<Void> ssubscribeLazy(Set<String> channels) {
+        return commandManager.submitNewCommand(
+                SSubscribe, channels.toArray(EMPTY_STRING_ARRAY), response -> null);
+    }
+
+    /**
+     * Subscribes the client to the specified sharded channels with a timeout.
+     *
+     * @param channels A set of sharded channel names to subscribe to
+     * @param timeoutMs Maximum time in milliseconds to wait for subscription confirmation
+     * @return A {@link CompletableFuture} that completes when the subscription is confirmed or times
+     *     out
+     * @example
+     *     <pre>{@code
+     * client.ssubscribe(Set.of("shard-news", "shard-updates"), 5000).get();
+     * }</pre>
+     *
+     * @see <a href="https://valkey.io/commands/ssubscribe/">valkey.io</a> for details
+     */
+    public CompletableFuture<Void> ssubscribe(Set<String> channels, int timeoutMs) {
+        if (timeoutMs < 0) {
+            throw new IllegalArgumentException("Timeout must be non-negative, got: " + timeoutMs);
+        }
+        String[] args = new String[channels.size() + 1];
+        int i = 0;
+        for (String channel : channels) {
+            args[i++] = channel;
+        }
+        args[i] = String.valueOf(timeoutMs);
+        return commandManager.submitNewCommand(SSubscribeBlocking, args, response -> null);
+    }
+
+    /**
+     * Unsubscribes the client from all currently subscribed sharded channels.
+     *
+     * @return A {@link CompletableFuture} that completes when the unsubscription request is processed
+     * @example
+     *     <pre>{@code
+     * client.sunsubscribe().get();
+     * }</pre>
+     *
+     * @see <a href="https://valkey.io/commands/sunsubscribe/">valkey.io</a> for details
+     */
+    public CompletableFuture<Void> sunsubscribe() {
+        return commandManager.submitNewCommand(SUnsubscribe, EMPTY_STRING_ARRAY, response -> null);
+    }
+
+    /**
+     * Unsubscribes the client from the specified sharded channels.
+     *
+     * @param channels A set of sharded channel names to unsubscribe from
+     * @return A {@link CompletableFuture} that completes when the unsubscription request is processed
+     * @example
+     *     <pre>{@code
+     * client.sunsubscribe(Set.of("shard-news", "shard-updates")).get();
+     * }</pre>
+     *
+     * @see <a href="https://valkey.io/commands/sunsubscribe/">valkey.io</a> for details
+     */
+    public CompletableFuture<Void> sunsubscribe(Set<String> channels) {
+        return commandManager.submitNewCommand(
+                SUnsubscribe, channels.toArray(EMPTY_STRING_ARRAY), response -> null);
+    }
+
+    /**
+     * Unsubscribes the client from the specified sharded channels with a timeout.
+     *
+     * @param channels A set of sharded channel names to unsubscribe from
+     * @param timeoutMs Maximum time in milliseconds to wait for unsubscription confirmation
+     * @return A {@link CompletableFuture} that completes when the unsubscription is confirmed or
+     *     times out
+     * @example
+     *     <pre>{@code
+     * client.sunsubscribe(Set.of("shard-news", "shard-updates"), 5000).get();
+     * }</pre>
+     *
+     * @see <a href="https://valkey.io/commands/sunsubscribe/">valkey.io</a> for details
+     */
+    public CompletableFuture<Void> sunsubscribe(Set<String> channels, int timeoutMs) {
+        if (timeoutMs < 0) {
+            throw new IllegalArgumentException("Timeout must be non-negative, got: " + timeoutMs);
+        }
+        String[] args = new String[channels.size() + 1];
+        int i = 0;
+        for (String channel : channels) {
+            args[i++] = channel;
+        }
+        args[i] = String.valueOf(timeoutMs);
+        return commandManager.submitNewCommand(SUnsubscribeBlocking, args, response -> null);
+    }
+
+    /**
+     * Unsubscribes the client from all currently subscribed sharded channels with a timeout.
+     *
+     * @param timeoutMs Maximum time in milliseconds to wait for unsubscription confirmation
+     * @return A {@link CompletableFuture} that completes when the unsubscription is confirmed or
+     *     times out
+     * @example
+     *     <pre>{@code
+     * client.sunsubscribe(5000).get();
+     * }</pre>
+     *
+     * @see <a href="https://valkey.io/commands/sunsubscribe/">valkey.io</a> for details
+     */
+    public CompletableFuture<Void> sunsubscribe(int timeoutMs) {
+        if (timeoutMs < 0) {
+            throw new IllegalArgumentException("Timeout must be non-negative, got: " + timeoutMs);
+        }
+        return commandManager.submitNewCommand(
+                SUnsubscribeBlocking, new String[] {String.valueOf(timeoutMs)}, response -> null);
+    }
+
+    /**
+     * Gets the current subscription state for this cluster client.
+     *
+     * <p>Returns the desired and actual subscription states, which may differ if subscriptions are
+     * being reconciled after a connection loss.
+     *
+     * <p>The returned {@link PubSubState} contains:
+     *
+     * <ul>
+     *   <li><b>Desired subscriptions</b>: The channels/patterns the client intends to be subscribed
+     *       to
+     *   <li><b>Actual subscriptions</b>: The channels/patterns currently subscribed on the server
+     * </ul>
+     *
+     * @return A {@link CompletableFuture} that completes with a {@link PubSubState} containing:
+     *     <ul>
+     *       <li>{@link
+     *           glide.api.models.configuration.ClusterSubscriptionConfiguration.PubSubClusterChannelMode#EXACT
+     *           EXACT} - Set of exact channel names
+     *       <li>{@link
+     *           glide.api.models.configuration.ClusterSubscriptionConfiguration.PubSubClusterChannelMode#PATTERN
+     *           PATTERN} - Set of pattern subscriptions
+     *       <li>{@link
+     *           glide.api.models.configuration.ClusterSubscriptionConfiguration.PubSubClusterChannelMode#SHARDED
+     *           SHARDED} - Set of sharded channel subscriptions
+     *     </ul>
+     *
+     * @example
+     *     <pre>{@code
+     * // Get current subscription state
+     * PubSubState<PubSubClusterChannelMode> state = client.getSubscriptions().get();
+     *
+     * // Check desired subscriptions
+     * Set<String> desiredChannels = state.getDesiredSubscriptions()
+     *     .getOrDefault(PubSubClusterChannelMode.EXACT, Set.of());
+     * Set<String> desiredSharded = state.getDesiredSubscriptions()
+     *     .getOrDefault(PubSubClusterChannelMode.SHARDED, Set.of());
+     *
+     * // Check actual subscriptions
+     * Set<String> actualChannels = state.getActualSubscriptions()
+     *     .getOrDefault(PubSubClusterChannelMode.EXACT, Set.of());
+     * }</pre>
+     *
+     * @see <a href="https://valkey.io/commands/pubsub-channels/">valkey.io</a> for PUBSUB CHANNELS
+     * @see <a href="https://valkey.io/commands/pubsub-numpat/">valkey.io</a> for PUBSUB NUMPAT
+     * @see <a href="https://valkey.io/commands/pubsub-shardchannels/">valkey.io</a> for PUBSUB
+     *     SHARDCHANNELS
+     */
+    public CompletableFuture<PubSubState<ClusterSubscriptionConfiguration.PubSubClusterChannelMode>>
+            getSubscriptions() {
+        return commandManager.submitNewCommand(
+                GetSubscriptions,
+                EMPTY_STRING_ARRAY,
+                response -> {
+                    Object[] arr = handleArrayResponse(response);
+                    Object[] parsed = (Object[]) parseSubscriptionState(arr);
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object[]> desiredMap = (Map<String, Object[]>) parsed[0];
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object[]> actualMap = (Map<String, Object[]>) parsed[1];
+
+                    Map<ClusterSubscriptionConfiguration.PubSubClusterChannelMode, Set<String>> desired =
+                            new java.util.HashMap<>();
+                    Map<ClusterSubscriptionConfiguration.PubSubClusterChannelMode, Set<String>> actual =
+                            new java.util.HashMap<>();
+
+                    for (Map.Entry<String, Object[]> entry : desiredMap.entrySet()) {
+                        String key = entry.getKey();
+                        Set<String> values =
+                                java.util.Arrays.stream(entry.getValue())
+                                        .map(Object::toString)
+                                        .collect(java.util.stream.Collectors.toSet());
+                        if ("Exact".equals(key)) {
+                            desired.put(ClusterSubscriptionConfiguration.PubSubClusterChannelMode.EXACT, values);
+                        } else if ("Pattern".equals(key)) {
+                            desired.put(
+                                    ClusterSubscriptionConfiguration.PubSubClusterChannelMode.PATTERN, values);
+                        } else if ("Sharded".equals(key)) {
+                            desired.put(
+                                    ClusterSubscriptionConfiguration.PubSubClusterChannelMode.SHARDED, values);
+                        }
+                    }
+
+                    for (Map.Entry<String, Object[]> entry : actualMap.entrySet()) {
+                        String key = entry.getKey();
+                        Set<String> values =
+                                java.util.Arrays.stream(entry.getValue())
+                                        .map(Object::toString)
+                                        .collect(java.util.stream.Collectors.toSet());
+                        if ("Exact".equals(key)) {
+                            actual.put(ClusterSubscriptionConfiguration.PubSubClusterChannelMode.EXACT, values);
+                        } else if ("Pattern".equals(key)) {
+                            actual.put(ClusterSubscriptionConfiguration.PubSubClusterChannelMode.PATTERN, values);
+                        } else if ("Sharded".equals(key)) {
+                            actual.put(ClusterSubscriptionConfiguration.PubSubClusterChannelMode.SHARDED, values);
+                        }
+                    }
+
+                    return new PubSubStateImpl<>(desired, actual);
+                });
+    }
+
+    @Override
+    public CompletableFuture<String> clusterInfo() {
+        return commandManager.submitNewCommand(ClusterInfo, new String[0], this::handleStringResponse);
+    }
+
+    @Override
+    public CompletableFuture<ClusterValue<String>> clusterInfo(@NonNull Route route) {
+        return commandManager.submitNewCommand(
+                ClusterInfo,
+                new String[0],
+                route,
+                response ->
+                        route instanceof SingleNodeRoute
+                                ? ClusterValue.of(handleStringResponse(response))
+                                : ClusterValue.of(handleMapResponse(response)));
+    }
+
+    @Override
+    public CompletableFuture<String> clusterNodes() {
+        return commandManager.submitNewCommand(ClusterNodes, new String[0], this::handleStringResponse);
+    }
+
+    @Override
+    public CompletableFuture<ClusterValue<String>> clusterNodes(@NonNull Route route) {
+        return commandManager.submitNewCommand(
+                ClusterNodes,
+                new String[0],
+                route,
+                response ->
+                        route instanceof SingleNodeRoute
+                                ? ClusterValue.of(handleStringResponse(response))
+                                : ClusterValue.of(handleMapResponse(response)));
+    }
+
+    @Override
+    public CompletableFuture<Object[]> clusterShards() {
+        return commandManager.submitNewCommand(ClusterShards, new String[0], this::handleArrayResponse);
+    }
+
+    @Override
+    public CompletableFuture<ClusterValue<Object[]>> clusterShards(@NonNull Route route) {
+        return commandManager.submitNewCommand(
+                ClusterShards,
+                new String[0],
+                route,
+                response ->
+                        route instanceof SingleNodeRoute
+                                ? ClusterValue.of(handleArrayResponse(response))
+                                : ClusterValue.of(handleMapResponse(response)));
+    }
+
+    @Override
+    public CompletableFuture<Object[]> clusterLinks() {
+        return commandManager.submitNewCommand(ClusterLinks, new String[0], this::handleArrayResponse);
+    }
+
+    @Override
+    public CompletableFuture<ClusterValue<Object[]>> clusterLinks(@NonNull Route route) {
+        return commandManager.submitNewCommand(
+                ClusterLinks,
+                new String[0],
+                route,
+                response ->
+                        route instanceof SingleNodeRoute
+                                ? ClusterValue.of(handleArrayResponse(response))
+                                : ClusterValue.of(handleMapResponse(response)));
+    }
+
+    @Override
+    public CompletableFuture<String> clusterMyId() {
+        return commandManager.submitNewCommand(ClusterMyId, new String[0], this::handleStringResponse);
+    }
+
+    @Override
+    public CompletableFuture<ClusterValue<String>> clusterMyId(@NonNull Route route) {
+        return commandManager.submitNewCommand(
+                ClusterMyId,
+                new String[0],
+                route,
+                response ->
+                        route instanceof SingleNodeRoute
+                                ? ClusterValue.of(handleStringResponse(response))
+                                : ClusterValue.of(handleMapResponse(response)));
+    }
+
+    @Override
+    public CompletableFuture<String> clusterMyShardId() {
+        return commandManager.submitNewCommand(
+                ClusterMyShardId, new String[0], this::handleStringResponse);
+    }
+
+    @Override
+    public CompletableFuture<ClusterValue<String>> clusterMyShardId(@NonNull Route route) {
+        return commandManager.submitNewCommand(
+                ClusterMyShardId,
+                new String[0],
+                route,
+                response ->
+                        route instanceof SingleNodeRoute
+                                ? ClusterValue.of(handleStringResponse(response))
+                                : ClusterValue.of(handleMapResponse(response)));
     }
 }

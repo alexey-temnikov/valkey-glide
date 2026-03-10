@@ -34,6 +34,8 @@ import static glide.api.models.commands.scan.ScanOptions.ObjectType.SET;
 import static glide.api.models.commands.scan.ScanOptions.ObjectType.STRING;
 import static glide.cluster.CommandTests.DEFAULT_INFO_SECTIONS;
 import static glide.cluster.CommandTests.EVERYTHING_INFO_SECTIONS;
+import static glide.utils.Java8Utils.createMap;
+import static glide.utils.Java8Utils.repeat;
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -44,7 +46,6 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
-import static org.junit.jupiter.api.Named.named;
 
 import glide.api.GlideClient;
 import glide.api.models.GlideString;
@@ -59,6 +60,7 @@ import glide.api.models.exceptions.RequestException;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -70,6 +72,10 @@ import java.util.concurrent.ExecutionException;
 import java.util.stream.Stream;
 import lombok.SneakyThrows;
 import org.apache.commons.lang3.ArrayUtils;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -80,20 +86,24 @@ public class CommandTests {
 
     private static final String INITIAL_VALUE = "VALUE";
 
+    private static final List<Arguments> clients = new ArrayList<>();
+
+    @BeforeAll
     @SneakyThrows
-    public static Stream<Arguments> getClients() {
-        return Stream.of(
+    public static void init() {
+        clients.add(
                 Arguments.of(
-                        named(
+                        Named.of(
                                 "RESP2",
                                 GlideClient.createClient(
                                                 commonClientConfig()
                                                         .requestTimeout(7000)
                                                         .protocol(ProtocolVersion.RESP2)
                                                         .build())
-                                        .get())),
+                                        .get())));
+        clients.add(
                 Arguments.of(
-                        named(
+                        Named.of(
                                 "RESP3",
                                 GlideClient.createClient(
                                                 commonClientConfig()
@@ -103,7 +113,30 @@ public class CommandTests {
                                         .get())));
     }
 
-    @ParameterizedTest
+    @AfterAll
+    @SneakyThrows
+    @SuppressWarnings("unchecked")
+    public static void teardown() {
+        for (Arguments client : clients) {
+            ((Named<GlideClient>) client.get()[0]).getPayload().close();
+        }
+    }
+
+    @AfterEach
+    @SneakyThrows
+    @SuppressWarnings("unchecked")
+    public void cleanup() {
+        // Flush all databases to ensure clean state between tests
+        for (Arguments client : clients) {
+            ((Named<GlideClient>) client.get()[0]).getPayload().flushall().get();
+        }
+    }
+
+    public static Stream<Arguments> getClients() {
+        return clients.stream();
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void custom_command_info(GlideClient regularClient) {
@@ -111,7 +144,7 @@ public class CommandTests {
         assertTrue(((String) data).contains("# Stats"));
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void custom_command_info_binary(GlideClient regularClient) {
@@ -120,19 +153,19 @@ public class CommandTests {
         assertTrue(data.toString().contains("# Stats"));
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void custom_command_del_returns_a_number(GlideClient regularClient) {
         String key = "custom_command_del_returns_a_number";
         regularClient.set(key, INITIAL_VALUE).get();
-        var del = regularClient.customCommand(new String[] {"DEL", key}).get();
+        Object del = regularClient.customCommand(new String[] {"DEL", key}).get();
         assertEquals(1L, del);
-        var data = regularClient.get(key).get();
+        String data = regularClient.get(key).get();
         assertNull(data);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void ping(GlideClient regularClient) {
@@ -140,7 +173,7 @@ public class CommandTests {
         assertEquals("PONG", data);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void ping_with_message(GlideClient regularClient) {
@@ -148,7 +181,7 @@ public class CommandTests {
         assertEquals("H3LL0", data);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void ping_binary_with_message(GlideClient regularClient) {
@@ -156,7 +189,7 @@ public class CommandTests {
         assertEquals(gs("H3LL0"), data);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void info_without_options(GlideClient regularClient) {
@@ -166,7 +199,7 @@ public class CommandTests {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void info_with_multiple_options(GlideClient regularClient) {
@@ -182,7 +215,7 @@ public class CommandTests {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void info_with_everything_option(GlideClient regularClient) {
@@ -192,7 +225,7 @@ public class CommandTests {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void simple_select_test(GlideClient regularClient) {
@@ -209,7 +242,7 @@ public class CommandTests {
         assertEquals(value, regularClient.get(key).get());
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void select_test_gives_error(GlideClient regularClient) {
@@ -218,7 +251,7 @@ public class CommandTests {
         assertInstanceOf(RequestException.class, e.getCause());
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void move(GlideClient regularClient) {
@@ -249,7 +282,7 @@ public class CommandTests {
         assertInstanceOf(RequestException.class, e.getCause());
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void move_binary(GlideClient regularClient) {
@@ -280,34 +313,34 @@ public class CommandTests {
         assertInstanceOf(RequestException.class, e.getCause());
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void clientId(GlideClient regularClient) {
-        var id = regularClient.clientId().get();
+        Long id = regularClient.clientId().get();
         assertTrue(id > 0);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void clientGetName(GlideClient regularClient) {
         // TODO replace with the corresponding command once implemented
         regularClient.customCommand(new String[] {"client", "setname", "clientGetName"}).get();
 
-        var name = regularClient.clientGetName().get();
+        String name = regularClient.clientGetName().get();
 
         assertEquals("clientGetName", name);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void config_reset_stat(GlideClient regularClient) {
         String data = regularClient.info(new Section[] {STATS}).get();
         long value_before = getValueFromInfo(data, "total_net_input_bytes");
 
-        var result = regularClient.configResetStat().get();
+        String result = regularClient.configResetStat().get();
         assertEquals(OK, result);
 
         data = regularClient.info(new Section[] {STATS}).get();
@@ -315,12 +348,12 @@ public class CommandTests {
         assertTrue(value_after < value_before);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void config_rewrite_non_existent_config_file(GlideClient regularClient) {
-        var info = regularClient.info(new Section[] {SERVER}).get();
-        var configFile = parseInfoResponseToMap(info).get("config_file");
+        String info = regularClient.info(new Section[] {SERVER}).get();
+        String configFile = parseInfoResponseToMap(info).get("config_file");
 
         if (configFile.isEmpty()) {
             ExecutionException executionException =
@@ -331,67 +364,70 @@ public class CommandTests {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void configGet_with_no_args_returns_error(GlideClient regularClient) {
-        var exception =
+        ExecutionException exception =
                 assertThrows(
                         ExecutionException.class, () -> regularClient.configGet(new String[] {}).get());
         assertInstanceOf(RequestException.class, exception.getCause());
         assertTrue(exception.getCause().getMessage().contains("wrong number of arguments"));
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void configGet_with_wildcard(GlideClient regularClient) {
-        var data = regularClient.configGet(new String[] {"*file"}).get();
+        Map<String, String> data = regularClient.configGet(new String[] {"*file"}).get();
         assertTrue(data.size() > 5);
         assertTrue(data.containsKey("pidfile"));
         assertTrue(data.containsKey("logfile"));
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void configGet_with_multiple_params(GlideClient regularClient) {
         assumeTrue(SERVER_VERSION.isGreaterThanOrEqualTo("7.0.0"), "This feature added in version 7");
-        var data = regularClient.configGet(new String[] {"pidfile", "logfile"}).get();
+        Map<String, String> data = regularClient.configGet(new String[] {"pidfile", "logfile"}).get();
         assertAll(
                 () -> assertEquals(2, data.size()),
                 () -> assertTrue(data.containsKey("pidfile")),
                 () -> assertTrue(data.containsKey("logfile")));
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void configSet_with_unknown_parameter_returns_error(GlideClient regularClient) {
-        var exception =
+        ExecutionException exception =
                 assertThrows(
                         ExecutionException.class,
-                        () -> regularClient.configSet(Map.of("Unknown Option", "Unknown Value")).get());
+                        () ->
+                                regularClient
+                                        .configSet(Collections.singletonMap("Unknown Option", "Unknown Value"))
+                                        .get());
         assertInstanceOf(RequestException.class, exception.getCause());
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void configSet_a_parameter(GlideClient regularClient) {
-        var oldValue = regularClient.configGet(new String[] {"maxclients"}).get().get("maxclients");
+        String oldValue = regularClient.configGet(new String[] {"maxclients"}).get().get("maxclients");
 
-        var response = regularClient.configSet(Map.of("maxclients", "42")).get();
+        String response = regularClient.configSet(Collections.singletonMap("maxclients", "42")).get();
         assertEquals(OK, response);
-        var newValue = regularClient.configGet(new String[] {"maxclients"}).get();
+        Map<String, String> newValue = regularClient.configGet(new String[] {"maxclients"}).get();
         assertEquals("42", newValue.get("maxclients"));
 
-        response = regularClient.configSet(Map.of("maxclients", oldValue)).get();
+        response = regularClient.configSet(Collections.singletonMap("maxclients", oldValue)).get();
         assertEquals(OK, response);
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void echo(GlideClient regularClient) {
         String message = "GLIDE";
@@ -403,7 +439,7 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void echo_gs(GlideClient regularClient) {
         byte[] message = {(byte) 0x01, (byte) 0x00, (byte) 0x01, (byte) 0x00, (byte) 0x02};
@@ -411,7 +447,7 @@ public class CommandTests {
         assertEquals(gs(message), response);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void time(GlideClient regularClient) {
@@ -427,20 +463,20 @@ public class CommandTests {
         assertTrue(Long.parseLong(result[1]) < 1000000);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void lastsave(GlideClient regularClient) {
         long result = regularClient.lastsave().get();
-        var yesterday = Instant.now().minus(1, ChronoUnit.DAYS);
+        Instant yesterday = Instant.now().minus(1, ChronoUnit.DAYS);
         assertTrue(Instant.ofEpochSecond(result).isAfter(yesterday));
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void lolwut_lolwut(GlideClient regularClient) {
-        var response = regularClient.lolwut().get();
+        String response = regularClient.lolwut().get();
         System.out.printf("%nLOLWUT standalone client standard response%n%s%n", response);
         assertTrue(
                 response.contains("ver") && response.contains(SERVER_VERSION.toString()),
@@ -486,7 +522,7 @@ public class CommandTests {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void dbsize_and_flushdb(GlideClient regularClient) {
@@ -512,7 +548,7 @@ public class CommandTests {
         if (SERVER_VERSION.isGreaterThanOrEqualTo("6.2.0")) {
             assertEquals(OK, regularClient.flushdb(SYNC).get());
         } else {
-            var executionException =
+            ExecutionException executionException =
                     assertThrows(ExecutionException.class, () -> regularClient.flushdb(SYNC).get());
             assertInstanceOf(RequestException.class, executionException.getCause());
             assertEquals(OK, regularClient.flushdb(ASYNC).get());
@@ -526,7 +562,7 @@ public class CommandTests {
         assertEquals(0L, regularClient.dbsize().get());
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void objectFreq(GlideClient regularClient) {
@@ -535,22 +571,24 @@ public class CommandTests {
         String oldPolicy =
                 regularClient.configGet(new String[] {maxmemoryPolicy}).get().get(maxmemoryPolicy);
         try {
-            assertEquals(OK, regularClient.configSet(Map.of(maxmemoryPolicy, "allkeys-lfu")).get());
+            assertEquals(
+                    OK,
+                    regularClient.configSet(Collections.singletonMap(maxmemoryPolicy, "allkeys-lfu")).get());
             assertEquals(OK, regularClient.set(key, "").get());
             assertTrue(regularClient.objectFreq(key).get() >= 0L);
         } finally {
-            regularClient.configSet(Map.of(maxmemoryPolicy, oldPolicy)).get();
+            regularClient.configSet(Collections.singletonMap(maxmemoryPolicy, oldPolicy)).get();
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void flushall(GlideClient regularClient) {
         if (SERVER_VERSION.isGreaterThanOrEqualTo("6.2.0")) {
             assertEquals(OK, regularClient.flushall(SYNC).get());
         } else {
-            var executionException =
+            ExecutionException executionException =
                     assertThrows(ExecutionException.class, () -> regularClient.flushall(SYNC).get());
             assertInstanceOf(RequestException.class, executionException.getCause());
             assertEquals(OK, regularClient.flushall(ASYNC).get());
@@ -565,7 +603,7 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void function_commands(GlideClient regularClient) {
         assumeTrue(SERVER_VERSION.isGreaterThanOrEqualTo("7.0.0"), "This feature added in version 7");
@@ -575,27 +613,28 @@ public class CommandTests {
         String libName = "mylib1c";
         String funcName = "myfunc1c";
         // function $funcName returns first argument
-        String code = generateLuaLibCode(libName, Map.of(funcName, "return args[1]"), true);
+        String code =
+                generateLuaLibCode(libName, Collections.singletonMap(funcName, "return args[1]"), true);
         assertEquals(libName, regularClient.functionLoad(code, false).get());
 
-        var functionResult =
+        Object functionResult =
                 regularClient.fcall(funcName, new String[0], new String[] {"one", "two"}).get();
         assertEquals("one", functionResult);
         functionResult =
                 regularClient.fcallReadOnly(funcName, new String[0], new String[] {"one", "two"}).get();
         assertEquals("one", functionResult);
 
-        var flist = regularClient.functionList(false).get();
-        var expectedDescription =
+        Map<String, Object>[] flist = regularClient.functionList(false).get();
+        Map<String, String> expectedDescription =
                 new HashMap<String, String>() {
                     {
                         put(funcName, null);
                     }
                 };
-        var expectedFlags =
+        Map<String, Set<String>> expectedFlags =
                 new HashMap<String, Set<String>>() {
                     {
-                        put(funcName, Set.of("no-writes"));
+                        put(funcName, Collections.singleton("no-writes"));
                     }
                 };
         checkFunctionListResponse(flist, libName, expectedDescription, expectedFlags, Optional.empty());
@@ -605,7 +644,7 @@ public class CommandTests {
                 flist, libName, expectedDescription, expectedFlags, Optional.of(code));
 
         // re-load library without overwriting
-        var executionException =
+        ExecutionException executionException =
                 assertThrows(ExecutionException.class, () -> regularClient.functionLoad(code, false).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
         assertTrue(
@@ -618,11 +657,12 @@ public class CommandTests {
         // function $newFuncName returns argument array len
         String newCode =
                 generateLuaLibCode(
-                        libName, Map.of(funcName, "return args[1]", newFuncName, "return #args"), true);
+                        libName, createMap(funcName, "return args[1]", newFuncName, "return #args"), true);
         assertEquals(libName, regularClient.functionLoad(newCode, true).get());
 
         // load new lib and delete it - first lib remains loaded
-        String anotherLib = generateLuaLibCode("anotherLib", Map.of("anotherFunc", ""), false);
+        String anotherLib =
+                generateLuaLibCode("anotherLib", Collections.singletonMap("anotherFunc", ""), false);
         assertEquals("anotherLib", regularClient.functionLoad(anotherLib, true).get());
         assertEquals(OK, regularClient.functionDelete("anotherLib").get());
 
@@ -635,7 +675,7 @@ public class CommandTests {
 
         flist = regularClient.functionList(libName, false).get();
         expectedDescription.put(newFuncName, null);
-        expectedFlags.put(newFuncName, Set.of("no-writes"));
+        expectedFlags.put(newFuncName, Collections.singleton("no-writes"));
         checkFunctionListResponse(flist, libName, expectedDescription, expectedFlags, Optional.empty());
 
         flist = regularClient.functionList(libName, true).get();
@@ -653,7 +693,7 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void function_commands_binary(GlideClient regularClient) {
         assumeTrue(SERVER_VERSION.isGreaterThanOrEqualTo("7.0.0"), "This feature added in version 7");
@@ -664,10 +704,11 @@ public class CommandTests {
         GlideString funcName = gs("myfunc1c");
         // function $funcName returns first argument
         GlideString code =
-                generateLuaLibCodeBinary(libName, Map.of(funcName, gs("return args[1]")), true);
+                generateLuaLibCodeBinary(
+                        libName, Collections.singletonMap(funcName, gs("return args[1]")), true);
         assertEquals(libName, regularClient.functionLoad(code, false).get());
 
-        var functionResult =
+        Object functionResult =
                 regularClient
                         .fcall(funcName, new GlideString[0], new GlideString[] {gs("one"), gs("two")})
                         .get();
@@ -678,17 +719,17 @@ public class CommandTests {
                         .get();
         assertEquals(gs("one"), functionResult);
 
-        var flist = regularClient.functionListBinary(false).get();
-        var expectedDescription =
+        Map<GlideString, Object>[] flist = regularClient.functionListBinary(false).get();
+        Map<GlideString, GlideString> expectedDescription =
                 new HashMap<GlideString, GlideString>() {
                     {
                         put(funcName, null);
                     }
                 };
-        var expectedFlags =
+        Map<GlideString, Set<GlideString>> expectedFlags =
                 new HashMap<GlideString, Set<GlideString>>() {
                     {
-                        put(funcName, Set.of(gs("no-writes")));
+                        put(funcName, Collections.singleton(gs("no-writes")));
                     }
                 };
         checkFunctionListResponseBinary(
@@ -699,7 +740,7 @@ public class CommandTests {
                 flist, libName, expectedDescription, expectedFlags, Optional.of(code));
 
         // re-load library without overwriting
-        var executionException =
+        ExecutionException executionException =
                 assertThrows(ExecutionException.class, () -> regularClient.functionLoad(code, false).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
         assertTrue(
@@ -712,12 +753,15 @@ public class CommandTests {
         // function $newFuncName returns argument array len
         GlideString newCode =
                 generateLuaLibCodeBinary(
-                        libName, Map.of(funcName, gs("return args[1]"), newFuncName, gs("return #args")), true);
+                        libName,
+                        createMap(funcName, gs("return args[1]"), newFuncName, gs("return #args")),
+                        true);
         assertEquals(libName, regularClient.functionLoad(newCode, true).get());
 
         // load new lib and delete it - first lib remains loaded
         GlideString anotherLib =
-                generateLuaLibCodeBinary(gs("anotherLib"), Map.of(gs("anotherFunc"), gs("")), false);
+                generateLuaLibCodeBinary(
+                        gs("anotherLib"), Collections.singletonMap(gs("anotherFunc"), gs("")), false);
         assertEquals(gs("anotherLib"), regularClient.functionLoad(anotherLib, true).get());
         assertEquals(OK, regularClient.functionDelete(gs("anotherLib")).get());
 
@@ -730,7 +774,7 @@ public class CommandTests {
 
         flist = regularClient.functionListBinary(libName, false).get();
         expectedDescription.put(newFuncName, null);
-        expectedFlags.put(newFuncName, Set.of(gs("no-writes")));
+        expectedFlags.put(newFuncName, Collections.singleton(gs("no-writes")));
         checkFunctionListResponseBinary(
                 flist, libName, expectedDescription, expectedFlags, Optional.empty());
 
@@ -753,7 +797,7 @@ public class CommandTests {
         assertEquals(OK, regularClient.functionFlush(ASYNC).get());
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void copy(GlideClient regularClient) {
@@ -804,7 +848,7 @@ public class CommandTests {
     }
 
     @Timeout(20)
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void functionKill_no_write(GlideClient regularClient) {
@@ -817,7 +861,7 @@ public class CommandTests {
         assertEquals(OK, regularClient.functionFlush(SYNC).get());
 
         // nothing to kill
-        var exception =
+        ExecutionException exception =
                 assertThrows(ExecutionException.class, () -> regularClient.functionKill().get());
         assertInstanceOf(RequestException.class, exception.getCause());
         assertTrue(exception.getMessage().toLowerCase().contains("notbusy"));
@@ -825,7 +869,7 @@ public class CommandTests {
         // load the lib
         assertEquals(libName, regularClient.functionLoad(code, true).get());
 
-        try (var testClient =
+        try (GlideClient testClient =
                 GlideClient.createClient(commonClientConfig().requestTimeout(10000).build()).get()) {
             try {
                 // call the function without await
@@ -855,7 +899,7 @@ public class CommandTests {
     }
 
     @Timeout(20)
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void functionKillBinary_no_write(GlideClient regularClient) {
@@ -869,7 +913,7 @@ public class CommandTests {
         assertEquals(OK, regularClient.functionFlush(SYNC).get());
 
         // nothing to kill
-        var exception =
+        ExecutionException exception =
                 assertThrows(ExecutionException.class, () -> regularClient.functionKill().get());
         assertInstanceOf(RequestException.class, exception.getCause());
         assertTrue(exception.getMessage().toLowerCase().contains("notbusy"));
@@ -877,7 +921,7 @@ public class CommandTests {
         // load the lib
         assertEquals(libName, regularClient.functionLoad(code, true).get());
 
-        try (var testClient =
+        try (GlideClient testClient =
                 GlideClient.createClient(commonClientConfig().requestTimeout(10000).build()).get()) {
             try {
                 // call the function without await
@@ -907,7 +951,7 @@ public class CommandTests {
     }
 
     @Timeout(20)
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void functionKill_write_function(GlideClient regularClient) {
@@ -923,7 +967,7 @@ public class CommandTests {
         assertEquals(OK, regularClient.functionFlush(SYNC).get());
 
         // nothing to kill
-        var exception =
+        ExecutionException exception =
                 assertThrows(ExecutionException.class, () -> regularClient.functionKill().get());
         assertInstanceOf(RequestException.class, exception.getCause());
         assertTrue(exception.getMessage().toLowerCase().contains("notbusy"));
@@ -931,7 +975,7 @@ public class CommandTests {
         // load the lib
         assertEquals(libName, regularClient.functionLoad(code, true).get());
 
-        try (var testClient =
+        try (GlideClient testClient =
                 GlideClient.createClient(commonClientConfig().requestTimeout(10000).build()).get()) {
             try {
                 // call the function without await
@@ -973,7 +1017,7 @@ public class CommandTests {
     }
 
     @Timeout(20)
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void functionKillBinary_write_function(GlideClient regularClient) {
@@ -990,7 +1034,7 @@ public class CommandTests {
         assertEquals(OK, regularClient.functionFlush(SYNC).get());
 
         // nothing to kill
-        var exception =
+        ExecutionException exception =
                 assertThrows(ExecutionException.class, () -> regularClient.functionKill().get());
         assertInstanceOf(RequestException.class, exception.getCause());
         assertTrue(exception.getMessage().toLowerCase().contains("notbusy"));
@@ -998,7 +1042,7 @@ public class CommandTests {
         // load the lib
         assertEquals(libName, regularClient.functionLoad(code, true).get());
 
-        try (var testClient =
+        try (GlideClient testClient =
                 GlideClient.createClient(commonClientConfig().requestTimeout(10000).build()).get()) {
             try {
                 // call the function without await
@@ -1039,7 +1083,7 @@ public class CommandTests {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void functionStats(GlideClient regularClient) {
@@ -1050,35 +1094,36 @@ public class CommandTests {
         assertEquals(OK, regularClient.functionFlush(SYNC).get());
 
         // function $funcName returns first argument
-        String code = generateLuaLibCode(libName, Map.of(funcName, "return args[1]"), false);
+        String code =
+                generateLuaLibCode(libName, Collections.singletonMap(funcName, "return args[1]"), false);
         assertEquals(libName, regularClient.functionLoad(code, true).get());
 
-        var response = regularClient.functionStats().get();
-        for (var nodeResponse : response.values()) {
+        Map<String, Map<String, Map<String, Object>>> response = regularClient.functionStats().get();
+        for (Map<String, Map<String, Object>> nodeResponse : response.values()) {
             checkFunctionStatsResponse(nodeResponse, new String[0], 1, 1);
         }
 
         code =
                 generateLuaLibCode(
                         libName + "_2",
-                        Map.of(funcName + "_2", "return 'OK'", funcName + "_3", "return 42"),
+                        createMap(funcName + "_2", "return 'OK'", funcName + "_3", "return 42"),
                         false);
         assertEquals(libName + "_2", regularClient.functionLoad(code, true).get());
 
         response = regularClient.functionStats().get();
-        for (var nodeResponse : response.values()) {
+        for (Map<String, Map<String, Object>> nodeResponse : response.values()) {
             checkFunctionStatsResponse(nodeResponse, new String[0], 2, 3);
         }
 
         assertEquals(OK, regularClient.functionFlush(SYNC).get());
 
         response = regularClient.functionStats().get();
-        for (var nodeResponse : response.values()) {
+        for (Map<String, Map<String, Object>> nodeResponse : response.values()) {
             checkFunctionStatsResponse(nodeResponse, new String[0], 0, 0);
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void functionStatsBinary(GlideClient regularClient) {
@@ -1090,18 +1135,20 @@ public class CommandTests {
 
         // function $funcName returns first argument
         GlideString code =
-                generateLuaLibCodeBinary(libName, Map.of(funcName, gs("return args[1]")), false);
+                generateLuaLibCodeBinary(
+                        libName, Collections.singletonMap(funcName, gs("return args[1]")), false);
         assertEquals(libName, regularClient.functionLoad(code, true).get());
 
-        var response = regularClient.functionStatsBinary().get();
-        for (var nodeResponse : response.values()) {
+        Map<String, Map<GlideString, Map<GlideString, Object>>> response =
+                regularClient.functionStatsBinary().get();
+        for (Map<GlideString, Map<GlideString, Object>> nodeResponse : response.values()) {
             checkFunctionStatsBinaryResponse(nodeResponse, new GlideString[0], 1, 1);
         }
 
         code =
                 generateLuaLibCodeBinary(
                         gs(libName.toString() + "_2"),
-                        Map.of(
+                        createMap(
                                 gs(funcName.toString() + "_2"),
                                 gs("return 'OK'"),
                                 gs(funcName.toString() + "_3"),
@@ -1110,19 +1157,19 @@ public class CommandTests {
         assertEquals(gs(libName.toString() + "_2"), regularClient.functionLoad(code, true).get());
 
         response = regularClient.functionStatsBinary().get();
-        for (var nodeResponse : response.values()) {
+        for (Map<GlideString, Map<GlideString, Object>> nodeResponse : response.values()) {
             checkFunctionStatsBinaryResponse(nodeResponse, new GlideString[0], 2, 3);
         }
 
         assertEquals(OK, regularClient.functionFlush(SYNC).get());
 
         response = regularClient.functionStatsBinary().get();
-        for (var nodeResponse : response.values()) {
+        for (Map<GlideString, Map<GlideString, Object>> nodeResponse : response.values()) {
             checkFunctionStatsBinaryResponse(nodeResponse, new GlideString[0], 0, 0);
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void function_dump_and_restore(GlideClient regularClient) {
@@ -1140,14 +1187,14 @@ public class CommandTests {
         // function $name1 returns first argument
         // function $name2 returns argument array len
         String code =
-                generateLuaLibCode(name1, Map.of(name1, "return args[1]", name2, "return #args"), false);
+                generateLuaLibCode(name1, createMap(name1, "return args[1]", name2, "return #args"), false);
         assertEquals(name1, regularClient.functionLoad(code, true).get());
-        var flist = regularClient.functionList(true).get();
+        Map<String, Object>[] flist = regularClient.functionList(true).get();
 
         final byte[] dump = regularClient.functionDump().get();
 
         // restore without cleaning the lib and/or overwrite option causes an error
-        var executionException =
+        ExecutionException executionException =
                 assertThrows(ExecutionException.class, () -> regularClient.functionRestore(dump).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
         assertTrue(executionException.getMessage().contains("Library " + name1 + " already exists"));
@@ -1166,7 +1213,8 @@ public class CommandTests {
 
         // create lib with another name, but with the same function names
         assertEquals(OK, regularClient.functionFlush(SYNC).get());
-        code = generateLuaLibCode(name2, Map.of(name1, "return args[1]", name2, "return #args"), false);
+        code =
+                generateLuaLibCode(name2, createMap(name1, "return args[1]", name2, "return #args"), false);
         assertEquals(name2, regularClient.functionLoad(code, true).get());
 
         // REPLACE policy now fails due to a name collision
@@ -1191,7 +1239,7 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void randomkey(GlideClient regularClient) {
         String key1 = "{key}" + UUID.randomUUID();
@@ -1209,7 +1257,7 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void randomKeyBinary(GlideClient regularClient) {
         GlideString key1 = gs("{key}" + UUID.randomUUID());
@@ -1226,7 +1274,7 @@ public class CommandTests {
         assertNull(regularClient.randomKeyBinary().get());
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void scan(GlideClient regularClient) {
@@ -1251,8 +1299,7 @@ public class CommandTests {
 
         // Negative cursor
         if (SERVER_VERSION.isGreaterThanOrEqualTo("8.0.0")) {
-            ExecutionException executionException =
-                    assertThrows(ExecutionException.class, () -> regularClient.scan("-1").get());
+            assertThrows(ExecutionException.class, () -> regularClient.scan("-1").get());
         } else {
             Object[] negativeResult = regularClient.scan("-1").get();
             assertEquals(initialCursor, negativeResult[resultCursorIndex]);
@@ -1285,7 +1332,7 @@ public class CommandTests {
         keys.forEach((key, value) -> assertTrue(ArrayUtils.contains(finalKeysFound, key)));
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void scan_binary(GlideClient regularClient) {
@@ -1311,8 +1358,7 @@ public class CommandTests {
 
         // Negative cursor
         if (SERVER_VERSION.isGreaterThanOrEqualTo("8.0.0")) {
-            ExecutionException executionException =
-                    assertThrows(ExecutionException.class, () -> regularClient.scan(gs("-1")).get());
+            assertThrows(ExecutionException.class, () -> regularClient.scan(gs("-1")).get());
         } else {
             Object[] negativeResult = regularClient.scan(gs("-1")).get();
             assertEquals(initialCursor, negativeResult[resultCursorIndex]);
@@ -1345,7 +1391,7 @@ public class CommandTests {
         keys.forEach((key, value) -> assertTrue(ArrayUtils.contains(finalKeysFound, key)));
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void scan_with_options(GlideClient regularClient) {
@@ -1381,9 +1427,7 @@ public class CommandTests {
         // Negative cursor
         if (SERVER_VERSION.isGreaterThanOrEqualTo("8.0.0")) {
             final ScanOptions finalOptions = options;
-            ExecutionException executionException =
-                    assertThrows(
-                            ExecutionException.class, () -> regularClient.scan("-1", finalOptions).get());
+            assertThrows(ExecutionException.class, () -> regularClient.scan("-1", finalOptions).get());
         } else {
             Object[] negativeResult = regularClient.scan("-1", options).get();
             assertEquals(initialCursor, negativeResult[resultCursorIndex]);
@@ -1434,7 +1478,7 @@ public class CommandTests {
         } while (!hashCursor.equals("0")); // 0 is returned for the cursor of the last iteration.
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void scan_binary_with_options(GlideClient regularClient) {
@@ -1471,9 +1515,8 @@ public class CommandTests {
         // Negative cursor
         if (SERVER_VERSION.isGreaterThanOrEqualTo("8.0.0")) {
             final ScanOptions finalOptions = options;
-            ExecutionException executionException =
-                    assertThrows(
-                            ExecutionException.class, () -> regularClient.scan(gs("-1"), finalOptions).get());
+            assertThrows(
+                    ExecutionException.class, () -> regularClient.scan(gs("-1"), finalOptions).get());
         } else {
             Object[] negativeResult = regularClient.scan(gs("-1"), options).get();
             assertEquals(initialCursor, negativeResult[resultCursorIndex]);
@@ -1525,7 +1568,7 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void invokeScript_test(GlideClient regularClient) {
         String key1 = UUID.randomUUID().toString();
@@ -1565,11 +1608,11 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void script_large_keys_and_or_args(GlideClient regularClient) {
-        String str1 = "0".repeat(1 << 12); // 4k
-        String str2 = "0".repeat(1 << 12); // 4k
+        String str1 = repeat("0", 1 << 12); // 4k
+        String str2 = repeat("0", 1 << 12); // 4k
 
         try (Script script = new Script("return KEYS[1]", false)) {
             // 1 very big key
@@ -1609,7 +1652,7 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void invokeScript_gs_test(GlideClient regularClient) {
         GlideString key1 = gs(UUID.randomUUID().toString());
@@ -1664,7 +1707,7 @@ public class CommandTests {
         // Get the SHA1 digests of the scripts
         String sha1_1 = script1.getHash();
         String sha1_2 = script2.getHash();
-        String nonExistentSha1 = "0".repeat(40); // A SHA1 that doesn't exist
+        String nonExistentSha1 = repeat("0", 40); // A SHA1 that doesn't exist
 
         // Check existence of scripts
         Boolean[] result =
@@ -1674,7 +1717,7 @@ public class CommandTests {
         script2.close();
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void scriptExistsBinary(GlideClient regularClient) {
@@ -1688,7 +1731,7 @@ public class CommandTests {
         // Get the SHA1 digests of the scripts
         GlideString sha1_1 = gs(script1.getHash());
         GlideString sha1_2 = gs(script2.getHash());
-        GlideString nonExistentSha1 = gs("0".repeat(40)); // A SHA1 that doesn't exist
+        GlideString nonExistentSha1 = gs(repeat("0", 40)); // A SHA1 that doesn't exist
 
         // Check existence of scripts
         Boolean[] result =
@@ -1698,7 +1741,7 @@ public class CommandTests {
         script2.close();
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void scriptFlush(GlideClient regularClient) {
@@ -1726,7 +1769,7 @@ public class CommandTests {
         script.close();
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void scriptKill(GlideClient regularClient) {
@@ -1744,7 +1787,7 @@ public class CommandTests {
         // create and load a long-running script
         Script script = new Script(createLongRunningLuaScript(6, true), true);
 
-        try (var testClient =
+        try (GlideClient testClient =
                 GlideClient.createClient(commonClientConfig().requestTimeout(10000).build()).get()) {
             try {
                 testClient.invokeScript(script);
@@ -1837,9 +1880,12 @@ public class CommandTests {
 
     @Timeout(20)
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void scriptKill_unkillable(GlideClient regularClient) {
+        // Ensure no script is blocking the server from a previous test
+        waitForNotBusy(regularClient::scriptKill);
+
         String key = UUID.randomUUID().toString();
         String code = createLongRunningLuaScript(6, false);
         Script script = new Script(code, false);
@@ -1847,7 +1893,7 @@ public class CommandTests {
         CompletableFuture<Object> promise = new CompletableFuture<>();
         promise.complete(null);
 
-        try (var testClient =
+        try (GlideClient testClient =
                 GlideClient.createClient(commonClientConfig().requestTimeout(10000).build()).get()) {
             try {
                 // run the script without await
@@ -1927,7 +1973,7 @@ public class CommandTests {
      * instance with the same hash still exists, even after the original reference is dropped and the
      * server cache is flushed.
      */
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void test_script_is_not_removed_while_another_instance_exists(GlideClient regularClient) {

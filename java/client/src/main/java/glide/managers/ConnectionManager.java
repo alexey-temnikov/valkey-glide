@@ -3,17 +3,29 @@ package glide.managers;
 
 import static connection_request.ConnectionRequestOuterClass.*;
 
+import glide.api.models.GlideString;
 import glide.api.models.configuration.AdvancedBaseClientConfiguration;
+import glide.api.models.configuration.AdvancedGlideClusterClientConfiguration;
 import glide.api.models.configuration.BackoffStrategy;
 import glide.api.models.configuration.BaseClientConfiguration;
+import glide.api.models.configuration.BaseSubscriptionConfiguration;
+import glide.api.models.configuration.ClusterSubscriptionConfiguration;
 import glide.api.models.configuration.GlideClientConfiguration;
 import glide.api.models.configuration.GlideClusterClientConfiguration;
+import glide.api.models.configuration.IamAuthConfig;
+import glide.api.models.configuration.PeriodicChecksConfig;
+import glide.api.models.configuration.PeriodicChecksManualInterval;
+import glide.api.models.configuration.PeriodicChecksStatus;
 import glide.api.models.configuration.ServerCredentials;
+import glide.api.models.configuration.StandaloneSubscriptionConfiguration;
 import glide.api.models.configuration.TlsAdvancedConfiguration;
 import glide.api.models.exceptions.ClosingException;
 import glide.api.models.exceptions.ConfigurationError;
+import glide.api.models.exceptions.GlideException;
 import glide.internal.AsyncRegistry;
 import glide.internal.GlideNativeBridge;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
 import lombok.RequiredArgsConstructor;
@@ -29,7 +41,7 @@ public class ConnectionManager {
     private static final String DEFAULT_LIB_NAME = "GlideJava";
 
     /** Native client handle for operations */
-    private long nativeClientHandle = 0;
+    private volatile long nativeClientHandle = 0;
 
     private int maxInflightRequests = 0;
     private int requestTimeoutMs = 5000;
@@ -46,12 +58,6 @@ public class ConnectionManager {
         return CompletableFuture.supplyAsync(
                 () -> {
                     try {
-                        // Convert addresses to simple string array
-                        String[] addresses =
-                                configuration.getAddresses().stream()
-                                        .map(addr -> addr.getHost() + ":" + addr.getPort())
-                                        .toArray(String[]::new);
-
                         // Extract credentials
                         if (configuration.getCredentials() != null) {
                             this.credentials = configuration.getCredentials();
@@ -99,18 +105,19 @@ public class ConnectionManager {
                         byte[][] subPattern = glide.internal.GlideCoreClient.EMPTY_2D_BYTE_ARRAY;
                         byte[][] subSharded = glide.internal.GlideCoreClient.EMPTY_2D_BYTE_ARRAY;
                         if (configuration.getSubscriptionConfiguration() != null) {
-                            var sc = configuration.getSubscriptionConfiguration();
+                            BaseSubscriptionConfiguration sc = configuration.getSubscriptionConfiguration();
                             try {
                                 if (sc
                                         instanceof glide.api.models.configuration.StandaloneSubscriptionConfiguration) {
-                                    var subs =
-                                            ((glide.api.models.configuration.StandaloneSubscriptionConfiguration) sc)
-                                                    .getSubscriptions();
-                                    var exact =
+                                    Map<StandaloneSubscriptionConfiguration.PubSubChannelMode, Set<GlideString>>
+                                            subs =
+                                                    ((glide.api.models.configuration.StandaloneSubscriptionConfiguration) sc)
+                                                            .getSubscriptions();
+                                    Set<GlideString> exact =
                                             subs.get(
                                                     glide.api.models.configuration.StandaloneSubscriptionConfiguration
                                                             .PubSubChannelMode.EXACT);
-                                    var pattern =
+                                    Set<GlideString> pattern =
                                             subs.get(
                                                     glide.api.models.configuration.StandaloneSubscriptionConfiguration
                                                             .PubSubChannelMode.PATTERN);
@@ -128,18 +135,19 @@ public class ConnectionManager {
                                     }
                                 } else if (sc
                                         instanceof glide.api.models.configuration.ClusterSubscriptionConfiguration) {
-                                    var subs =
-                                            ((glide.api.models.configuration.ClusterSubscriptionConfiguration) sc)
-                                                    .getSubscriptions();
-                                    var exact =
+                                    Map<ClusterSubscriptionConfiguration.PubSubClusterChannelMode, Set<GlideString>>
+                                            subs =
+                                                    ((glide.api.models.configuration.ClusterSubscriptionConfiguration) sc)
+                                                            .getSubscriptions();
+                                    Set<GlideString> exact =
                                             subs.get(
                                                     glide.api.models.configuration.ClusterSubscriptionConfiguration
                                                             .PubSubClusterChannelMode.EXACT);
-                                    var pattern =
+                                    Set<GlideString> pattern =
                                             subs.get(
                                                     glide.api.models.configuration.ClusterSubscriptionConfiguration
                                                             .PubSubClusterChannelMode.PATTERN);
-                                    var sharded =
+                                    Set<GlideString> sharded =
                                             subs.get(
                                                     glide.api.models.configuration.ClusterSubscriptionConfiguration
                                                             .PubSubClusterChannelMode.SHARDED);
@@ -169,16 +177,10 @@ public class ConnectionManager {
                         // Build ConnectionRequest protobuf
                         ConnectionRequest.Builder requestBuilder = ConnectionRequest.newBuilder();
 
-                        // Add addresses
-                        for (String addr : addresses) {
-                            String[] parts = addr.split(":");
-                            if (parts.length == 2) {
-                                requestBuilder.addAddresses(
-                                        NodeAddress.newBuilder()
-                                                .setHost(parts[0])
-                                                .setPort(Integer.parseInt(parts[1]))
-                                                .build());
-                            }
+                        for (glide.api.models.configuration.NodeAddress addr : configuration.getAddresses()) {
+                            NodeAddress nodeAddress =
+                                    NodeAddress.newBuilder().setHost(addr.getHost()).setPort(addr.getPort()).build();
+                            requestBuilder.addAddresses(nodeAddress);
                         }
 
                         // Set TLS mode
@@ -203,7 +205,7 @@ public class ConnectionManager {
                             }
                             // Set IAM credentials if present
                             if (credentials.getIamConfig() != null) {
-                                var iamConfig = credentials.getIamConfig();
+                                IamAuthConfig iamConfig = credentials.getIamConfig();
                                 IamCredentials.Builder iamBuilder = IamCredentials.newBuilder();
                                 iamBuilder.setClusterName(iamConfig.getClusterName());
                                 iamBuilder.setRegion(iamConfig.getRegion());
@@ -230,13 +232,37 @@ public class ConnectionManager {
                         // Set cluster mode
                         requestBuilder.setClusterModeEnabled(isCluster);
 
-                        // Set refresh topology from initial nodes for cluster mode
+                        // Set topology configs for cluster mode
                         if (isCluster) {
                             GlideClusterClientConfiguration clusterConfig =
                                     (GlideClusterClientConfiguration) configuration;
-                            if (clusterConfig.getAdvancedConfiguration() != null) {
+
+                            AdvancedGlideClusterClientConfiguration advancedConfig =
+                                    clusterConfig.getAdvancedConfiguration();
+
+                            if (advancedConfig != null) {
+                                // Set refresh topology from initial nodes
                                 requestBuilder.setRefreshTopologyFromInitialNodes(
-                                        clusterConfig.getAdvancedConfiguration().isRefreshTopologyFromInitialNodes());
+                                        advancedConfig.isRefreshTopologyFromInitialNodes());
+
+                                // Set periodic checks configuration
+                                PeriodicChecksConfig periodicChecks = advancedConfig.getPeriodicChecks();
+                                if (periodicChecks instanceof PeriodicChecksStatus) {
+                                    PeriodicChecksStatus status = (PeriodicChecksStatus) periodicChecks;
+                                    if (status == PeriodicChecksStatus.DISABLED) {
+                                        requestBuilder.setPeriodicChecksDisabled(
+                                                PeriodicChecksDisabled.newBuilder().build());
+                                    }
+                                    // ENABLED_DEFAULT_CONFIGS → use server default, don't set anything
+                                } else if (periodicChecks instanceof PeriodicChecksManualInterval) {
+                                    PeriodicChecksManualInterval manualInterval =
+                                            (PeriodicChecksManualInterval) periodicChecks;
+                                    requestBuilder.setPeriodicChecksManualInterval(
+                                            connection_request.ConnectionRequestOuterClass.PeriodicChecksManualInterval
+                                                    .newBuilder()
+                                                    .setDurationInSec(manualInterval.getDurationInSec())
+                                                    .build());
+                                }
                             }
                         }
 
@@ -344,9 +370,23 @@ public class ConnectionManager {
                         }
 
                         // Set TCP_NODELAY option (only if explicitly configured)
-                        AdvancedBaseClientConfiguration advanced = extractAdvancedConfiguration(configuration);
+                        AdvancedBaseClientConfiguration advanced = configuration.getAdvancedConfiguration();
                         if (advanced != null && advanced.getTcpNoDelay() != null) {
                             requestBuilder.setTcpNodelay(advanced.getTcpNoDelay());
+                        }
+
+                        // Set PubSub reconciliation interval (only if explicitly configured)
+                        if (advanced != null && advanced.getPubsubReconciliationIntervalMs() != null) {
+                            requestBuilder.setPubsubReconciliationIntervalMs(
+                                    advanced.getPubsubReconciliationIntervalMs());
+                        }
+
+                        // Set read-only mode for standalone clients
+                        if (configuration instanceof GlideClientConfiguration) {
+                            GlideClientConfiguration standaloneConfig = (GlideClientConfiguration) configuration;
+                            if (standaloneConfig.isReadOnly()) {
+                                requestBuilder.setReadOnly(true);
+                            }
                         }
 
                         // Build and serialize to bytes
@@ -362,10 +402,10 @@ public class ConnectionManager {
 
                         return null; // Success
                     } catch (Exception e) {
-                        if (e instanceof ClosingException) {
-                            throw e;
+                        if (e instanceof GlideException) {
+                            throw (GlideException) e;
                         }
-                        throw new RuntimeException("Failed to create client", e);
+                        throw new ClosingException("Failed to create client: " + e.getMessage());
                     }
                 });
     }
@@ -411,7 +451,10 @@ public class ConnectionManager {
                 nativeClientHandle = 0;
             }
         } catch (Exception e) {
-            throw new RuntimeException("Failed to close client", e);
+            if (e instanceof GlideException) {
+                throw (GlideException) e;
+            }
+            throw new ClosingException("Failed to close client: " + e.getMessage());
         }
     }
 
@@ -473,7 +516,7 @@ public class ConnectionManager {
     }
 
     private static int resolveConnectionTimeout(BaseClientConfiguration configuration) {
-        AdvancedBaseClientConfiguration advanced = extractAdvancedConfiguration(configuration);
+        AdvancedBaseClientConfiguration advanced = configuration.getAdvancedConfiguration();
         if (advanced != null && advanced.getConnectionTimeout() != null) {
             return advanced.getConnectionTimeout();
         }
@@ -481,7 +524,7 @@ public class ConnectionManager {
     }
 
     private static boolean resolveInsecureTls(BaseClientConfiguration configuration) {
-        AdvancedBaseClientConfiguration advanced = extractAdvancedConfiguration(configuration);
+        AdvancedBaseClientConfiguration advanced = configuration.getAdvancedConfiguration();
         if (advanced == null) {
             return false;
         }
@@ -497,7 +540,7 @@ public class ConnectionManager {
     }
 
     private static byte[] extractRootCertificates(BaseClientConfiguration configuration) {
-        AdvancedBaseClientConfiguration advanced = extractAdvancedConfiguration(configuration);
+        AdvancedBaseClientConfiguration advanced = configuration.getAdvancedConfiguration();
         if (advanced == null) {
             return null;
         }
@@ -506,16 +549,5 @@ public class ConnectionManager {
             return null;
         }
         return tlsConfig.getRootCertificates();
-    }
-
-    private static AdvancedBaseClientConfiguration extractAdvancedConfiguration(
-            BaseClientConfiguration configuration) {
-        if (configuration instanceof GlideClientConfiguration) {
-            return ((GlideClientConfiguration) configuration).getAdvancedConfiguration();
-        }
-        if (configuration instanceof GlideClusterClientConfiguration) {
-            return ((GlideClusterClientConfiguration) configuration).getAdvancedConfiguration();
-        }
-        return null;
     }
 }

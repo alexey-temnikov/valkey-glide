@@ -196,6 +196,7 @@ type baseClientConfiguration struct {
 	reconnectStrategy *BackoffStrategy
 	lazyConnect       bool
 	DatabaseId        *int `json:"database_id,omitempty"`
+	compressionConfig *CompressionConfiguration
 }
 
 func (config *baseClientConfiguration) toProtobuf() (*protobuf.ConnectionRequest, error) {
@@ -248,6 +249,14 @@ func (config *baseClientConfiguration) toProtobuf() (*protobuf.ConnectionRequest
 
 	if config.DatabaseId != nil {
 		request.DatabaseId = uint32(*config.DatabaseId)
+	}
+
+	if config.compressionConfig != nil {
+		compressionPb, err := config.compressionConfig.toProtobuf()
+		if err != nil {
+			return nil, fmt.Errorf("invalid compression configuration: %w", err)
+		}
+		request.CompressionConfig = compressionPb
 	}
 
 	return &request, nil
@@ -314,6 +323,10 @@ type ClientConfiguration struct {
 	baseClientConfiguration
 	subscriptionConfig *StandaloneSubscriptionConfig
 	AdvancedClientConfiguration
+	// readOnly enables read-only mode for the standalone client.
+	// When enabled, the client will skip primary node detection during connection initialization
+	// and will reject write commands. This is useful for connecting to replica-only deployments.
+	readOnly bool
 }
 
 // NewClientConfiguration returns a [ClientConfiguration] with default configuration settings. For further
@@ -329,7 +342,17 @@ func (config *ClientConfiguration) ToProtobuf() (*protobuf.ConnectionRequest, er
 	}
 	request.ClusterModeEnabled = false
 
-	if config.subscriptionConfig != nil && len(config.subscriptionConfig.subscriptions) > 0 {
+	// Handle read-only mode validation and configuration
+	if config.readOnly {
+		// Validate that read-only mode is not combined with AZAffinity strategies
+		if request.ReadFrom == protobuf.ReadFrom_AZAffinity ||
+			request.ReadFrom == protobuf.ReadFrom_AZAffinityReplicasAndPrimary {
+			return nil, errors.New("read-only mode is not compatible with AZAffinity strategies")
+		}
+		request.ReadOnly = &config.readOnly
+	}
+
+	if config.subscriptionConfig != nil {
 		request.PubsubSubscriptions = config.subscriptionConfig.toProtobuf()
 	}
 
@@ -344,6 +367,12 @@ func (config *ClientConfiguration) ToProtobuf() (*protobuf.ConnectionRequest, er
 	// Handle TCP_NODELAY configuration
 	if config.AdvancedClientConfiguration.tcpNoDelay != nil {
 		request.TcpNodelay = config.AdvancedClientConfiguration.tcpNoDelay
+	}
+
+	// Handle PubSub reconciliation interval
+	if config.AdvancedClientConfiguration.pubsubReconciliationIntervalMs != nil {
+		intervalMs := uint32(*config.AdvancedClientConfiguration.pubsubReconciliationIntervalMs)
+		request.PubsubReconciliationIntervalMs = &intervalMs
 	}
 
 	// Handle TLS configuration
@@ -455,6 +484,16 @@ func (config *ClientConfiguration) WithDatabaseId(id int) *ClientConfiguration {
 	return config
 }
 
+// WithCompressionConfiguration sets the compression configuration for the client.
+// When configured, values sent to the server will be automatically compressed if they
+// meet the minimum size threshold.
+func (config *ClientConfiguration) WithCompressionConfiguration(
+	compressionConfig *CompressionConfiguration,
+) *ClientConfiguration {
+	config.compressionConfig = compressionConfig
+	return config
+}
+
 // WithAdvancedConfiguration sets the advanced configuration settings for the client.
 func (config *ClientConfiguration) WithAdvancedConfiguration(
 	advancedConfig *AdvancedClientConfiguration,
@@ -471,8 +510,20 @@ func (config *ClientConfiguration) WithSubscriptionConfig(
 	return config
 }
 
+// WithReadOnly enables read-only mode for the standalone client.
+// When enabled, the client will skip primary node detection during connection initialization
+// and will reject write commands. This is useful for connecting to replica-only deployments.
+//
+// Note: Read-only mode is not compatible with AZAffinity or AZAffinityReplicasAndPrimary
+// read strategies. Attempting to use these combinations will result in an error during
+// client creation.
+func (config *ClientConfiguration) WithReadOnly(readOnly bool) *ClientConfiguration {
+	config.readOnly = readOnly
+	return config
+}
+
 func (config *ClientConfiguration) HasSubscription() bool {
-	return config.subscriptionConfig != nil && len(config.subscriptionConfig.subscriptions) > 0
+	return config.subscriptionConfig != nil
 }
 
 func (config *ClientConfiguration) GetSubscription() *StandaloneSubscriptionConfig {
@@ -514,7 +565,7 @@ func (config *ClusterClientConfiguration) ToProtobuf() (*protobuf.ConnectionRequ
 		}
 		request.ConnectionTimeout = connectionTimeout
 	}
-	if config.subscriptionConfig != nil && len(config.subscriptionConfig.subscriptions) > 0 {
+	if config.subscriptionConfig != nil {
 		request.PubsubSubscriptions = config.subscriptionConfig.toProtobuf()
 	}
 	request.RefreshTopologyFromInitialNodes = config.AdvancedClusterClientConfiguration.refreshTopologyFromInitialNodes
@@ -522,6 +573,12 @@ func (config *ClusterClientConfiguration) ToProtobuf() (*protobuf.ConnectionRequ
 	// Handle TCP_NODELAY configuration
 	if config.AdvancedClusterClientConfiguration.tcpNoDelay != nil {
 		request.TcpNodelay = config.AdvancedClusterClientConfiguration.tcpNoDelay
+	}
+
+	// Handle PubSub reconciliation interval
+	if config.AdvancedClusterClientConfiguration.pubsubReconciliationIntervalMs != nil {
+		intervalMs := uint32(*config.AdvancedClusterClientConfiguration.pubsubReconciliationIntervalMs)
+		request.PubsubReconciliationIntervalMs = &intervalMs
 	}
 
 	// Handle TLS configuration
@@ -637,6 +694,16 @@ func (config *ClusterClientConfiguration) WithDatabaseId(id int) *ClusterClientC
 	return config
 }
 
+// WithCompressionConfiguration sets the compression configuration for the cluster client.
+// When configured, values sent to the server will be automatically compressed if they
+// meet the minimum size threshold.
+func (config *ClusterClientConfiguration) WithCompressionConfiguration(
+	compressionConfig *CompressionConfiguration,
+) *ClusterClientConfiguration {
+	config.compressionConfig = compressionConfig
+	return config
+}
+
 // WithAdvancedConfiguration sets the advanced configuration settings for the client.
 func (config *ClusterClientConfiguration) WithAdvancedConfiguration(
 	advancedConfig *AdvancedClusterClientConfiguration,
@@ -654,7 +721,7 @@ func (config *ClusterClientConfiguration) WithSubscriptionConfig(
 }
 
 func (config *ClusterClientConfiguration) HasSubscription() bool {
-	return config.subscriptionConfig != nil && len(config.subscriptionConfig.subscriptions) > 0
+	return config.subscriptionConfig != nil
 }
 
 func (config *ClusterClientConfiguration) GetSubscription() *ClusterSubscriptionConfig {
@@ -752,9 +819,10 @@ func LoadRootCertificatesFromFile(path string) ([]byte, error) {
 
 // Represents advanced configuration settings for a Standalone client used in [ClientConfiguration].
 type AdvancedClientConfiguration struct {
-	connectionTimeout time.Duration
-	tlsConfig         *TlsConfiguration
-	tcpNoDelay        *bool
+	connectionTimeout              time.Duration
+	tlsConfig                      *TlsConfiguration
+	tcpNoDelay                     *bool
+	pubsubReconciliationIntervalMs *int
 }
 
 // NewAdvancedClientConfiguration returns a new [AdvancedClientConfiguration] with default settings.
@@ -799,6 +867,16 @@ func (config *AdvancedClientConfiguration) WithTcpNoDelay(
 	return config
 }
 
+// WithPubSubReconciliationIntervalMs sets the interval in milliseconds between PubSub subscription
+// reconciliation attempts. The reconciliation process ensures that the client's desired subscriptions
+// match the actual subscriptions on the server.
+func (config *AdvancedClientConfiguration) WithPubSubReconciliationIntervalMs(
+	intervalMs int,
+) *AdvancedClientConfiguration {
+	config.pubsubReconciliationIntervalMs = &intervalMs
+	return config
+}
+
 // Represents advanced configuration settings for a Cluster client used in
 // [ClusterClientConfiguration].
 type AdvancedClusterClientConfiguration struct {
@@ -806,6 +884,7 @@ type AdvancedClusterClientConfiguration struct {
 	refreshTopologyFromInitialNodes bool
 	tlsConfig                       *TlsConfiguration
 	tcpNoDelay                      *bool
+	pubsubReconciliationIntervalMs  *int
 }
 
 // NewAdvancedClusterClientConfiguration returns a new [AdvancedClusterClientConfiguration] with default settings.
@@ -857,5 +936,15 @@ func (config *AdvancedClusterClientConfiguration) WithTcpNoDelay(
 	tcpNoDelay bool,
 ) *AdvancedClusterClientConfiguration {
 	config.tcpNoDelay = &tcpNoDelay
+	return config
+}
+
+// WithPubSubReconciliationIntervalMs sets the interval in milliseconds between PubSub subscription
+// reconciliation attempts. The reconciliation process ensures that the client's desired subscriptions
+// match the actual subscriptions on the server.
+func (config *AdvancedClusterClientConfiguration) WithPubSubReconciliationIntervalMs(
+	intervalMs int,
+) *AdvancedClusterClientConfiguration {
+	config.pubsubReconciliationIntervalMs = &intervalMs
 	return config
 }

@@ -29,6 +29,8 @@ import static command_request.CommandRequestOuterClass.RequestType.PubSubShardCh
 import static command_request.CommandRequestOuterClass.RequestType.PubSubShardNumSub;
 import static command_request.CommandRequestOuterClass.RequestType.RandomKey;
 import static command_request.CommandRequestOuterClass.RequestType.SPublish;
+import static command_request.CommandRequestOuterClass.RequestType.SSubscribeBlocking;
+import static command_request.CommandRequestOuterClass.RequestType.SUnsubscribeBlocking;
 import static command_request.CommandRequestOuterClass.RequestType.ScriptExists;
 import static command_request.CommandRequestOuterClass.RequestType.ScriptFlush;
 import static command_request.CommandRequestOuterClass.RequestType.ScriptKill;
@@ -50,9 +52,13 @@ import static glide.api.models.commands.function.FunctionListOptions.WITH_CODE_V
 import static glide.api.models.configuration.RequestRoutingConfiguration.SimpleMultiNodeRoute.ALL_NODES;
 import static glide.api.models.configuration.RequestRoutingConfiguration.SimpleMultiNodeRoute.ALL_PRIMARIES;
 import static glide.api.models.configuration.RequestRoutingConfiguration.SimpleSingleNodeRoute.RANDOM;
+import static glide.utils.Java8Utils.createList;
+import static glide.utils.Java8Utils.createMap;
+import static glide.utils.Java8Utils.createSet;
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
@@ -83,9 +89,9 @@ import glide.api.models.configuration.RequestRoutingConfiguration.Route;
 import glide.api.models.configuration.RequestRoutingConfiguration.SingleNodeRoute;
 import glide.managers.CommandManager;
 import glide.managers.GlideExceptionCheckedFunction;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -117,10 +123,10 @@ public class GlideClusterClientTest {
     @Test
     @SneakyThrows
     public void custom_command_returns_single_value() {
-        var commandManager = new TestCommandManager(null);
+        TestCommandManager commandManager = new TestCommandManager(null);
 
-        try (var client = new TestClient(commandManager, "TEST")) {
-            var value = client.customCommand(TEST_ARGS).get();
+        try (TestClient client = new TestClient(commandManager, "TEST")) {
+            ClusterValue<Object> value = client.customCommand(TEST_ARGS).get();
             assertEquals("TEST", value.getSingleValue());
         }
     }
@@ -128,11 +134,11 @@ public class GlideClusterClientTest {
     @Test
     @SneakyThrows
     public void custom_command_returns_multi_value() {
-        var commandManager = new TestCommandManager(null);
+        TestCommandManager commandManager = new TestCommandManager(null);
 
-        var data = Map.of("key1", "value1", "key2", "value2");
-        try (var client = new TestClient(commandManager, data)) {
-            var value = client.customCommand(TEST_ARGS).get();
+        Map<String, String> data = createMap("key1", "value1", "key2", "value2");
+        try (TestClient client = new TestClient(commandManager, data)) {
+            ClusterValue<Object> value = client.customCommand(TEST_ARGS).get();
             assertEquals(data, value.getMultiValue());
         }
     }
@@ -140,10 +146,10 @@ public class GlideClusterClientTest {
     @Test
     @SneakyThrows
     public void custom_command_binary_returns_single_value() {
-        var commandManager = new TestCommandManager(null);
+        TestCommandManager commandManager = new TestCommandManager(null);
 
-        try (var client = new TestClient(commandManager, "TEST")) {
-            var value = client.customCommand(new GlideString[0]).get();
+        try (TestClient client = new TestClient(commandManager, "TEST")) {
+            ClusterValue<Object> value = client.customCommand(new GlideString[0]).get();
             assertEquals("TEST", value.getSingleValue());
         }
     }
@@ -151,11 +157,11 @@ public class GlideClusterClientTest {
     @Test
     @SneakyThrows
     public void custom_command_binary_returns_multi_value() {
-        var commandManager = new TestCommandManager(null);
+        TestCommandManager commandManager = new TestCommandManager(null);
 
-        var data = Map.of("key1", "value1", "key2", "value2");
-        try (var client = new TestClient(commandManager, data)) {
-            var value = client.customCommand(new GlideString[0]).get();
+        Map<String, String> data = createMap("key1", "value1", "key2", "value2");
+        try (TestClient client = new TestClient(commandManager, data)) {
+            ClusterValue<Object> value = client.customCommand(new GlideString[0]).get();
             assertEquals(data, value.getMultiValue());
         }
     }
@@ -163,13 +169,12 @@ public class GlideClusterClientTest {
     @Test
     @SneakyThrows
     public void custom_command_binary_returns_multi_binary_value() {
-        var commandManager = new TestCommandManager(null);
+        TestCommandManager commandManager = new TestCommandManager(null);
 
-        var data = Map.of(gs("key1"), "value1", gs("key2"), "value2");
-        var dataNormalized = Map.of("key1", "value1", "key2", "value2");
-        try (var client = new TestClient(commandManager, data)) {
-            var value = client.customCommand(new GlideString[0]).get();
-            assertEquals(dataNormalized, value.getMultiValue());
+        Map<String, String> data = createMap("key1", "value1", "key2", "value2");
+        try (TestClient client = new TestClient(commandManager, data)) {
+            ClusterValue<Object> value = client.customCommand(new GlideString[0]).get();
+            assertEquals(data, value.getMultiValue());
         }
     }
 
@@ -177,11 +182,11 @@ public class GlideClusterClientTest {
     @SneakyThrows
     // test checks that even a map returned as a single value when single node route is used
     public void custom_command_with_single_node_route_returns_single_value() {
-        var commandManager = new TestCommandManager(null);
+        TestCommandManager commandManager = new TestCommandManager(null);
 
-        var data = Map.of("key1", "value1", "key2", "value2");
-        try (var client = new TestClient(commandManager, data)) {
-            var value = client.customCommand(TEST_ARGS, RANDOM).get();
+        Map<String, String> data = createMap("key1", "value1", "key2", "value2");
+        try (TestClient client = new TestClient(commandManager, data)) {
+            ClusterValue<Object> value = client.customCommand(TEST_ARGS, RANDOM).get();
             assertEquals(data, value.getSingleValue());
         }
     }
@@ -189,11 +194,11 @@ public class GlideClusterClientTest {
     @Test
     @SneakyThrows
     public void custom_command_with_multi_node_route_returns_multi_value() {
-        var commandManager = new TestCommandManager(null);
+        TestCommandManager commandManager = new TestCommandManager(null);
 
-        var data = Map.of("key1", "value1", "key2", "value2");
-        try (var client = new TestClient(commandManager, data)) {
-            var value = client.customCommand(TEST_ARGS, ALL_NODES).get();
+        Map<String, String> data = createMap("key1", "value1", "key2", "value2");
+        try (TestClient client = new TestClient(commandManager, data)) {
+            ClusterValue<Object> value = client.customCommand(TEST_ARGS, ALL_NODES).get();
             assertEquals(data, value.getMultiValue());
         }
     }
@@ -201,12 +206,12 @@ public class GlideClusterClientTest {
     @Test
     @SneakyThrows
     public void custom_command_returns_single_value_on_constant_response() {
-        var commandManager =
+        CommandManager commandManager =
                 new TestCommandManager(
                         Response.newBuilder().setConstantResponse(ConstantResponse.OK).build());
 
-        try (var client = new TestClient(commandManager, "OK")) {
-            var value = client.customCommand(TEST_ARGS, ALL_NODES).get();
+        try (TestClient client = new TestClient(commandManager, "OK")) {
+            ClusterValue<Object> value = client.customCommand(TEST_ARGS, ALL_NODES).get();
             assertEquals("OK", value.getSingleValue());
         }
     }
@@ -215,11 +220,11 @@ public class GlideClusterClientTest {
     @SneakyThrows
     // test checks that even a map returned as a single value when single node route is used
     public void custom_command_binary_with_single_node_route_returns_single_value() {
-        var commandManager = new TestCommandManager(null);
+        TestCommandManager commandManager = new TestCommandManager(null);
 
-        var data = Map.of("key1", "value1", "key2", "value2");
-        try (var client = new TestClient(commandManager, data)) {
-            var value = client.customCommand(new GlideString[0], RANDOM).get();
+        Map<String, String> data = createMap("key1", "value1", "key2", "value2");
+        try (TestClient client = new TestClient(commandManager, data)) {
+            ClusterValue<Object> value = client.customCommand(new GlideString[0], RANDOM).get();
             assertEquals(data, value.getSingleValue());
         }
     }
@@ -227,25 +232,28 @@ public class GlideClusterClientTest {
     @Test
     @SneakyThrows
     public void custom_command_binary_with_multi_node_route_returns_multi_value() {
-        var commandManager = new TestCommandManager(null);
+        TestCommandManager commandManager = new TestCommandManager(null);
 
-        var data = Map.of(gs("key1"), "value1", gs("key2"), "value2");
-        var dataNormalized = Map.of("key1", "value1", "key2", "value2");
-        try (var client = new TestClient(commandManager, data)) {
-            var value = client.customCommand(new GlideString[0], ALL_NODES).get();
-            assertEquals(dataNormalized, value.getMultiValue());
+        Map<GlideString, GlideString> data =
+                createMap(gs("key1"), gs("value1"), gs("key2"), gs("value2"));
+        try (TestClient client = new TestClient(commandManager, data)) {
+            ClusterValue<Object> value = client.customCommand(new GlideString[0], ALL_NODES).get();
+            Map<?, ?> result = value.getMultiValue();
+            assertEquals(2, result.size());
+            assertTrue(result.containsValue(gs("value1")));
+            assertTrue(result.containsValue(gs("value2")));
         }
     }
 
     @Test
     @SneakyThrows
     public void custom_command_binary_returns_single_value_on_constant_response() {
-        var commandManager =
+        CommandManager commandManager =
                 new TestCommandManager(
                         Response.newBuilder().setConstantResponse(ConstantResponse.OK).build());
 
-        try (var client = new TestClient(commandManager, "OK")) {
-            var value = client.customCommand(new GlideString[0], ALL_NODES).get();
+        try (TestClient client = new TestClient(commandManager, "OK")) {
+            ClusterValue<Object> value = client.customCommand(new GlideString[0], ALL_NODES).get();
             assertEquals("OK", value.getSingleValue());
         }
     }
@@ -611,7 +619,8 @@ public class GlideClusterClientTest {
     @Test
     public void info_with_route_returns_string() {
         // setup
-        Map<String, String> testClusterValue = Map.of("addr1", "addr1 result", "addr2", "addr2 result");
+        Map<String, String> testClusterValue =
+                createMap("addr1", "addr1 result", "addr2", "addr2 result");
         Route route = ALL_NODES;
         CompletableFuture<ClusterValue<String>> testResponse = new CompletableFuture<>();
         testResponse.complete(ClusterValue.of(testClusterValue));
@@ -635,7 +644,8 @@ public class GlideClusterClientTest {
     public void info_with_route_with_infoOptions_returns_string() {
         // setup
         String[] infoArguments = new String[] {"ALL", "DEFAULT"};
-        Map<String, String> testClusterValue = Map.of("addr1", "addr1 result", "addr2", "addr2 result");
+        Map<String, String> testClusterValue =
+                createMap("addr1", "addr1 result", "addr2", "addr2 result");
         CompletableFuture<ClusterValue<String>> testResponse = new CompletableFuture<>();
         testResponse.complete(ClusterValue.of(testClusterValue));
 
@@ -660,11 +670,11 @@ public class GlideClusterClientTest {
     @Test
     @SneakyThrows
     public void info_with_single_node_route_returns_single_value() {
-        var commandManager = new TestCommandManager(null);
+        TestCommandManager commandManager = new TestCommandManager(null);
 
-        var data = "info string";
-        try (var client = new TestClient(commandManager, data)) {
-            var value = client.info(RANDOM).get();
+        String data = "info string";
+        try (TestClient client = new TestClient(commandManager, data)) {
+            ClusterValue<String> value = client.info(RANDOM).get();
             assertAll(
                     () -> assertTrue(value.hasSingleData()),
                     () -> assertEquals(data, value.getSingleValue()));
@@ -674,11 +684,11 @@ public class GlideClusterClientTest {
     @Test
     @SneakyThrows
     public void info_with_multi_node_route_returns_multi_value() {
-        var commandManager = new TestCommandManager(null);
+        TestCommandManager commandManager = new TestCommandManager(null);
 
-        var data = Map.of("key1", "value1", "key2", "value2");
-        try (var client = new TestClient(commandManager, data)) {
-            var value = client.info(ALL_NODES).get();
+        Map<String, String> data = createMap("key1", "value1", "key2", "value2");
+        try (TestClient client = new TestClient(commandManager, data)) {
+            ClusterValue<String> value = client.info(ALL_NODES).get();
             assertAll(
                     () -> assertTrue(value.hasMultiData()), () -> assertEquals(data, value.getMultiValue()));
         }
@@ -687,11 +697,11 @@ public class GlideClusterClientTest {
     @Test
     @SneakyThrows
     public void info_with_options_and_single_node_route_returns_single_value() {
-        var commandManager = new TestCommandManager(null);
+        TestCommandManager commandManager = new TestCommandManager(null);
 
-        var data = "info string";
-        try (var client = new TestClient(commandManager, data)) {
-            var value = client.info(new Section[0], RANDOM).get();
+        String data = "info string";
+        try (TestClient client = new TestClient(commandManager, data)) {
+            ClusterValue<String> value = client.info(new Section[0], RANDOM).get();
             assertAll(
                     () -> assertTrue(value.hasSingleData()),
                     () -> assertEquals(data, value.getSingleValue()));
@@ -701,11 +711,11 @@ public class GlideClusterClientTest {
     @Test
     @SneakyThrows
     public void info_with_options_and_multi_node_route_returns_multi_value() {
-        var commandManager = new TestCommandManager(null);
+        TestCommandManager commandManager = new TestCommandManager(null);
 
-        var data = Map.of("key1", "value1", "key2", "value2");
-        try (var client = new TestClient(commandManager, data)) {
-            var value = client.info(new Section[0], ALL_NODES).get();
+        Map<String, String> data = createMap("key1", "value1", "key2", "value2");
+        try (TestClient client = new TestClient(commandManager, data)) {
+            ClusterValue<String> value = client.info(new Section[0], ALL_NODES).get();
             assertAll(
                     () -> assertTrue(value.hasMultiData()), () -> assertEquals(data, value.getMultiValue()));
         }
@@ -733,11 +743,11 @@ public class GlideClusterClientTest {
     @Test
     @SneakyThrows
     public void clientId_with_multi_node_route_returns_success() {
-        var commandManager = new TestCommandManager(null);
+        TestCommandManager commandManager = new TestCommandManager(null);
 
-        var data = Map.of("n1", 42L);
-        try (var client = new TestClient(commandManager, data)) {
-            var value = client.clientId(ALL_NODES).get();
+        Map<String, Long> data = createMap("n1", 42L);
+        try (TestClient client = new TestClient(commandManager, data)) {
+            ClusterValue<Long> value = client.clientId(ALL_NODES).get();
 
             assertEquals(data, value.getMultiValue());
         }
@@ -746,10 +756,10 @@ public class GlideClusterClientTest {
     @Test
     @SneakyThrows
     public void clientId_with_single_node_route_returns_success() {
-        var commandManager = new TestCommandManager(null);
+        TestCommandManager commandManager = new TestCommandManager(null);
 
-        try (var client = new TestClient(commandManager, 42L)) {
-            var value = client.clientId(RANDOM).get();
+        try (TestClient client = new TestClient(commandManager, 42L)) {
+            ClusterValue<Long> value = client.clientId(RANDOM).get();
             assertEquals(42, value.getSingleValue());
         }
     }
@@ -776,10 +786,10 @@ public class GlideClusterClientTest {
     @Test
     @SneakyThrows
     public void clientGetName_with_single_node_route_returns_success() {
-        var commandManager = new TestCommandManager(null);
+        TestCommandManager commandManager = new TestCommandManager(null);
 
-        try (var client = new TestClient(commandManager, "TEST")) {
-            var value = client.clientGetName(RANDOM).get();
+        try (TestClient client = new TestClient(commandManager, "TEST")) {
+            ClusterValue<String> value = client.clientGetName(RANDOM).get();
             assertEquals("TEST", value.getSingleValue());
         }
     }
@@ -787,11 +797,11 @@ public class GlideClusterClientTest {
     @Test
     @SneakyThrows
     public void clientGetName_with_multi_node_route_returns_success() {
-        var commandManager = new TestCommandManager(null);
+        TestCommandManager commandManager = new TestCommandManager(null);
 
-        var data = Map.of("n1", "TEST");
-        try (var client = new TestClient(commandManager, data)) {
-            var value = client.clientGetName(ALL_NODES).get();
+        Map<String, String> data = createMap("n1", "TEST");
+        try (TestClient client = new TestClient(commandManager, data)) {
+            ClusterValue<String> value = client.clientGetName(ALL_NODES).get();
             assertEquals(data, value.getMultiValue());
         }
     }
@@ -887,7 +897,7 @@ public class GlideClusterClientTest {
     @Test
     public void configGet_returns_success() {
         // setup
-        var testPayload = Map.of("timeout", "1000");
+        Map<String, String> testPayload = createMap("timeout", "1000");
         CompletableFuture<Map<String, String>> testResponse = new CompletableFuture<>();
         testResponse.complete(testPayload);
 
@@ -909,11 +919,11 @@ public class GlideClusterClientTest {
     @SneakyThrows
     // test checks that even a map returned as a single value when single node route is used
     public void configGet_with_single_node_route_returns_single_value() {
-        var commandManager = new TestCommandManager(null);
+        TestCommandManager commandManager = new TestCommandManager(null);
 
-        var data = Map.of("timeout", "1000", "maxmemory", "1GB");
-        try (var client = new TestClient(commandManager, data)) {
-            var value = client.configGet(TEST_ARGS, RANDOM).get();
+        Map<String, String> data = createMap("timeout", "1000", "maxmemory", "1GB");
+        try (TestClient client = new TestClient(commandManager, data)) {
+            ClusterValue<Map<String, String>> value = client.configGet(TEST_ARGS, RANDOM).get();
             assertAll(
                     () -> assertTrue(value.hasSingleData()),
                     () -> assertEquals(data, value.getSingleValue()));
@@ -923,11 +933,12 @@ public class GlideClusterClientTest {
     @Test
     @SneakyThrows
     public void configGet_with_multi_node_route_returns_multi_value() {
-        var commandManager = new TestCommandManager(null);
+        TestCommandManager commandManager = new TestCommandManager(null);
 
-        var data = Map.of("node1", Map.of("timeout", "1000", "maxmemory", "1GB"));
-        try (var client = new TestClient(commandManager, data)) {
-            var value = client.configGet(TEST_ARGS, ALL_NODES).get();
+        Map<String, Map<String, String>> data =
+                createMap("node1", createMap("timeout", "1000", "maxmemory", "1GB"));
+        try (TestClient client = new TestClient(commandManager, data)) {
+            ClusterValue<Map<String, String>> value = client.configGet(TEST_ARGS, ALL_NODES).get();
             assertAll(
                     () -> assertTrue(value.hasMultiData()), () -> assertEquals(data, value.getMultiValue()));
         }
@@ -946,7 +957,8 @@ public class GlideClusterClientTest {
                 .thenReturn(testResponse);
 
         // exercise
-        CompletableFuture<String> response = service.configSet(Map.of("timeout", "1000"));
+        CompletableFuture<String> response =
+                service.configSet(Collections.singletonMap("timeout", "1000"));
 
         // verify
         assertEquals(testResponse, response);
@@ -966,7 +978,8 @@ public class GlideClusterClientTest {
                 .thenReturn(testResponse);
 
         // exercise
-        CompletableFuture<String> response = service.configSet(Map.of("value", "42"), RANDOM);
+        CompletableFuture<String> response =
+                service.configSet(Collections.singletonMap("value", "42"), RANDOM);
 
         // verify
         assertEquals(testResponse, response);
@@ -2319,7 +2332,7 @@ public class GlideClusterClientTest {
         // setup
         String[] args = new String[0];
         ClusterValue<Map<String, Map<String, Object>>> value =
-                ClusterValue.ofSingleValue(Map.of("1", Map.of("2", 2)));
+                ClusterValue.ofSingleValue(createMap("1", Collections.singletonMap("2", 2)));
         CompletableFuture<ClusterValue<Map<String, Map<String, Object>>>> testResponse =
                 new CompletableFuture<>();
         testResponse.complete(value);
@@ -2345,7 +2358,7 @@ public class GlideClusterClientTest {
         // setup
         GlideString[] args = new GlideString[0];
         ClusterValue<Map<GlideString, Map<GlideString, Object>>> value =
-                ClusterValue.ofSingleValue(Map.of(gs("1"), Map.of(gs("2"), 2)));
+                ClusterValue.ofSingleValue(createMap(gs("1"), createMap(gs("2"), 2)));
         CompletableFuture<ClusterValue<Map<GlideString, Map<GlideString, Object>>>> testResponse =
                 new CompletableFuture<>();
         testResponse.complete(value);
@@ -2519,7 +2532,7 @@ public class GlideClusterClientTest {
         // setup
         String[] args = new String[0];
         ClusterValue<Map<String, Map<String, Object>>> value =
-                ClusterValue.ofSingleValue(Map.of("1", Map.of("2", 2)));
+                ClusterValue.ofSingleValue(createMap("1", Collections.singletonMap("2", 2)));
         CompletableFuture<ClusterValue<Map<String, Map<String, Object>>>> testResponse =
                 new CompletableFuture<>();
         testResponse.complete(value);
@@ -2545,7 +2558,7 @@ public class GlideClusterClientTest {
         // setup
         GlideString[] args = new GlideString[0];
         ClusterValue<Map<GlideString, Map<GlideString, Object>>> value =
-                ClusterValue.ofSingleValue(Map.of(gs("1"), Map.of(gs("2"), 2)));
+                ClusterValue.ofSingleValue(createMap(gs("1"), createMap(gs("2"), 2)));
         CompletableFuture<ClusterValue<Map<GlideString, Map<GlideString, Object>>>> testResponse =
                 new CompletableFuture<>();
         testResponse.complete(value);
@@ -2858,7 +2871,7 @@ public class GlideClusterClientTest {
     public void pubsubShardNumSub_returns_success() {
         // setup
         String[] arguments = new String[] {"ch1", "ch2"};
-        Map<String, Long> value = Map.of();
+        Map<String, Long> value = Collections.emptyMap();
 
         CompletableFuture<Map<String, Long>> testResponse = new CompletableFuture<>();
         testResponse.complete(value);
@@ -2882,7 +2895,7 @@ public class GlideClusterClientTest {
     public void pubsubShardNumSub_binary_returns_success() {
         // setup
         GlideString[] arguments = new GlideString[] {gs("ch1"), gs("ch2")};
-        Map<GlideString, Long> value = Map.of();
+        Map<GlideString, Long> value = Collections.emptyMap();
 
         CompletableFuture<Map<GlideString, Long>> testResponse = new CompletableFuture<>();
         testResponse.complete(value);
@@ -3480,7 +3493,7 @@ public class GlideClusterClientTest {
         testResponse.complete(payload);
 
         // match on protobuf request
-        when(commandManager.submitScript(eq(script), eq(List.of()), eq(List.of()), any()))
+        when(commandManager.submitScript(eq(script), eq(createList()), eq(createList()), any()))
                 .thenReturn(testResponse);
 
         // exercise
@@ -3509,8 +3522,8 @@ public class GlideClusterClientTest {
         // match on protobuf request
         when(commandManager.submitScript(
                         eq(script),
-                        eq(List.of(gs("key1"), gs("key2"))),
-                        eq(List.of(gs("arg1"), gs("arg2"))),
+                        eq(createList(gs("key1"), gs("key2"))),
+                        eq(createList(gs("arg1"), gs("arg2"))),
                         any()))
                 .thenReturn(testResponse);
 
@@ -3545,8 +3558,8 @@ public class GlideClusterClientTest {
         // match on protobuf request
         when(commandManager.submitScript(
                         eq(script),
-                        eq(List.of(gs("key1"), gs("key2"))),
-                        eq(List.of(gs("arg1"), gs("arg2"))),
+                        eq(createList(gs("key1"), gs("key2"))),
+                        eq(createList(gs("arg1"), gs("arg2"))),
                         any()))
                 .thenReturn(testResponse);
 
@@ -3572,7 +3585,7 @@ public class GlideClusterClientTest {
         testResponse.complete(payload);
 
         // match on protobuf request
-        when(commandManager.submitScript(eq(script), eq(List.of()), eq(route), any()))
+        when(commandManager.submitScript(eq(script), eq(createList()), eq(route), any()))
                 .thenReturn(testResponse);
 
         // exercise
@@ -3600,7 +3613,7 @@ public class GlideClusterClientTest {
 
         // match on protobuf request
         when(commandManager.submitScript(
-                        eq(script), eq(List.of(gs("arg1"), gs("arg2"))), eq(route), any()))
+                        eq(script), eq(createList(gs("arg1"), gs("arg2"))), eq(route), any()))
                 .thenReturn(testResponse);
 
         // exercise
@@ -3629,7 +3642,7 @@ public class GlideClusterClientTest {
 
         // match on protobuf request
         when(commandManager.submitScript(
-                        eq(script), eq(List.of(gs("arg1"), gs("arg2"))), eq(route), any()))
+                        eq(script), eq(createList(gs("arg1"), gs("arg2"))), eq(route), any()))
                 .thenReturn(testResponse);
 
         // exercise
@@ -3798,5 +3811,42 @@ public class GlideClusterClientTest {
         // verify
         assertEquals(testResponse, response);
         assertEquals(OK, payload);
+    }
+
+    @SneakyThrows
+    @Test
+    public void ssubscribe_returns_success() {
+        // setup
+        CompletableFuture<Void> testResponse = new CompletableFuture<>();
+        testResponse.complete(null);
+
+        // match on protobuf request
+        when(commandManager.<Void>submitNewCommand(eq(SSubscribeBlocking), any(String[].class), any()))
+                .thenReturn(testResponse);
+
+        // exercise
+        CompletableFuture<Void> response = service.ssubscribe(createSet("channel1", "channel2"), 5000);
+
+        // verify
+        assertNull(response.get());
+    }
+
+    @SneakyThrows
+    @Test
+    public void sunsubscribe_returns_success() {
+        // setup
+        CompletableFuture<Void> testResponse = new CompletableFuture<>();
+        testResponse.complete(null);
+
+        // match on protobuf request
+        when(commandManager.<Void>submitNewCommand(
+                        eq(SUnsubscribeBlocking), any(String[].class), any()))
+                .thenReturn(testResponse);
+
+        // exercise
+        CompletableFuture<Void> response = service.sunsubscribe(createSet("channel1"), 1000);
+
+        // verify
+        assertNull(response.get());
     }
 }

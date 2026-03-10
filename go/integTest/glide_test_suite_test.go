@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -60,7 +61,6 @@ var (
 		"",
 		"Specifies specific endpoints the standalone server is running on",
 	)
-	pubsubtest       = flag.Bool("pubsub", false, "Set to true to run pubsub tests")
 	longTimeoutTests = flag.Bool("long-timeout-tests", false, "Set to true to run tests with longer timeouts")
 	otelTest         = flag.Bool("otel-test", false, "Set to true to run opentelemetry tests")
 )
@@ -403,14 +403,19 @@ func (suite *GlideTestSuite) defaultClientConfig() *config.ClientConfiguration {
 		WithUseTLS(suite.tls).
 		WithRequestTimeout(5 * time.Second)
 
+	// Set default connection timeout for tests
+	advancedConfig := config.NewAdvancedClientConfiguration().
+		WithConnectionTimeout(10 * time.Second)
+
 	// If TLS is enabled, try to load custom certificates
 	if suite.tls {
 		if certData, certErr := loadCaCertificateForTests(); certErr == nil {
 			tlsConfig := config.NewTlsConfiguration().WithRootCertificates(certData)
-			advancedConfig := config.NewAdvancedClientConfiguration().WithTlsConfiguration(tlsConfig)
-			clientConfig = clientConfig.WithAdvancedConfiguration(advancedConfig)
+			advancedConfig = advancedConfig.WithTlsConfiguration(tlsConfig)
 		}
 	}
+
+	clientConfig = clientConfig.WithAdvancedConfiguration(advancedConfig)
 
 	return clientConfig
 }
@@ -441,14 +446,19 @@ func (suite *GlideTestSuite) defaultClusterClientConfig() *config.ClusterClientC
 		WithUseTLS(suite.tls).
 		WithRequestTimeout(5 * time.Second)
 
+	// Set default connection timeout for tests
+	advancedConfig := config.NewAdvancedClusterClientConfiguration().
+		WithConnectionTimeout(10 * time.Second)
+
 	// If TLS is enabled, try to load custom certificates
 	if suite.tls {
 		if certData, certErr := loadCaCertificateForTests(); certErr == nil {
 			tlsConfig := config.NewTlsConfiguration().WithRootCertificates(certData)
-			advancedConfig := config.NewAdvancedClusterClientConfiguration().WithTlsConfiguration(tlsConfig)
-			clientConfig = clientConfig.WithAdvancedConfiguration(advancedConfig)
+			advancedConfig = advancedConfig.WithTlsConfiguration(tlsConfig)
 		}
 	}
+
+	clientConfig = clientConfig.WithAdvancedConfiguration(advancedConfig)
 
 	return clientConfig
 }
@@ -530,7 +540,7 @@ func (suite *GlideTestSuite) runParallelizedWithClients(
 				select {
 				case <-done:
 				case <-tm.C:
-					suite.T().Fatalf("parallelized test timeout in %s", timeout)
+					suite.T().Fatalf("parallelized test timeout")
 				}
 			}
 		})
@@ -568,6 +578,22 @@ const (
 // Get the string representation of the client type
 func (c *ClientType) String() string {
 	return []string{"StandaloneClient", "ClusterClient"}[*c]
+}
+
+// Get the string representation of the message read method
+func (m MessageReadMethod) String() string {
+	switch m {
+	case CallbackMethod:
+		return "Callback"
+	case WaitForMessageMethod:
+		return "WaitForMessage"
+	case SignalChannelMethod:
+		return "SignalChannel"
+	case SyncLoopMethod:
+		return "SyncLoop"
+	default:
+		return "Unknown"
+	}
 }
 
 func (suite *GlideTestSuite) createAnyClient(clientType ClientType, subscription any) interfaces.BaseClientCommands {
@@ -664,6 +690,14 @@ const (
 	WaitForMessageMethod
 	SignalChannelMethod
 	SyncLoopMethod
+)
+
+type SubscriptionMethod int
+
+const (
+	ConfigMethod SubscriptionMethod = iota
+	LazyMethod
+	BlockingMethod
 )
 
 // verifyPubsubMessages verifies that subscribers received the expected messages
@@ -797,6 +831,7 @@ func (suite *GlideTestSuite) verifyPubsubMessages(
 //   - channels: A slice of ChannelDefn objects defining the channels to subscribe to
 //   - clientId: A unique identifier for this subscriber
 //   - withCallback: Whether to use callback-based message handling
+//   - subscriptionMethod: How to subscribe (Config, Lazy, or Blocking)
 //   - t: The testing.T instance for proper error handling in subtests
 //
 // Returns:
@@ -806,44 +841,167 @@ func (suite *GlideTestSuite) CreatePubSubReceiver(
 	channels []ChannelDefn,
 	clientId int,
 	withCallback bool,
+	subscriptionMethod SubscriptionMethod,
 	t *testing.T,
 ) interfaces.BaseClientCommands {
 	callback := func(message *models.PubSubMessage, context any) {
 		callbackCtx.Store(fmt.Sprintf("%d-%s", clientId, message.Channel), message)
 	}
+
 	switch clientType {
 	case StandaloneClient:
-		if channels[0].Mode == ShardedMode {
+		if len(channels) > 0 && slices.IndexFunc(channels, func(channel ChannelDefn) bool {
+			return channel.Mode == ShardedMode
+		}) >= 0 {
 			t.Fatalf("Sharded mode is not supported for standalone client")
 			return nil
 		}
 
-		sConfig := config.NewStandaloneSubscriptionConfig()
-		for _, channel := range channels {
-			mode := config.PubSubChannelMode(channel.Mode)
-			sConfig = sConfig.WithSubscription(mode, channel.Channel)
+		var client *glide.Client
+		var err error
+
+		if subscriptionMethod == ConfigMethod {
+			sConfig := config.NewStandaloneSubscriptionConfig()
+			for _, channel := range channels {
+				mode := config.PubSubChannelMode(channel.Mode)
+				sConfig = sConfig.WithSubscription(mode, channel.Channel)
+			}
+			if withCallback {
+				sConfig = sConfig.WithCallback(callback, &callbackCtx)
+			}
+			var baseClient interfaces.BaseClientCommands
+			baseClient, err = suite.createAnyClientWithTesting(StandaloneClient, sConfig)
+			require.NoError(t, err)
+			client = baseClient.(*glide.Client)
+		} else {
+			// For Lazy/Blocking, create client with empty config only if callback is provided
+			var baseClient interfaces.BaseClientCommands
+			if withCallback {
+				sConfig := config.NewStandaloneSubscriptionConfig().WithCallback(callback, &callbackCtx)
+				baseClient, err = suite.createAnyClientWithTesting(StandaloneClient, sConfig)
+			} else {
+				baseClient, err = suite.createAnyClientWithTesting(StandaloneClient, nil)
+			}
+			require.NoError(t, err)
+			client = baseClient.(*glide.Client)
+
+			// Subscribe dynamically
+			suite.subscribeByMethod(client, nil, channels, subscriptionMethod, t)
 		}
-		if withCallback {
-			sConfig = sConfig.WithCallback(callback, &callbackCtx)
-		}
-		client, err := suite.createAnyClientWithTesting(StandaloneClient, sConfig)
-		require.NoError(t, err)
 		return client
+
 	case ClusterClient:
-		cConfig := config.NewClusterSubscriptionConfig()
-		for _, channel := range channels {
-			mode := config.PubSubClusterChannelMode(channel.Mode)
-			cConfig = cConfig.WithSubscription(mode, channel.Channel)
+		var client *glide.ClusterClient
+		var err error
+
+		if subscriptionMethod == ConfigMethod {
+			cConfig := config.NewClusterSubscriptionConfig()
+			for _, channel := range channels {
+				mode := config.PubSubClusterChannelMode(channel.Mode)
+				cConfig = cConfig.WithSubscription(mode, channel.Channel)
+			}
+			if withCallback {
+				cConfig = cConfig.WithCallback(callback, &callbackCtx)
+			}
+			var baseClient interfaces.BaseClientCommands
+			baseClient, err = suite.createAnyClientWithTesting(ClusterClient, cConfig)
+			require.NoError(t, err)
+			client = baseClient.(*glide.ClusterClient)
+		} else {
+			// For Lazy/Blocking, create client with empty config only if callback is provided
+			var baseClient interfaces.BaseClientCommands
+			if withCallback {
+				cConfig := config.NewClusterSubscriptionConfig().WithCallback(callback, &callbackCtx)
+				baseClient, err = suite.createAnyClientWithTesting(ClusterClient, cConfig)
+			} else {
+				baseClient, err = suite.createAnyClientWithTesting(ClusterClient, nil)
+			}
+			require.NoError(t, err)
+			client = baseClient.(*glide.ClusterClient)
+
+			// Subscribe dynamically
+			suite.subscribeByMethod(nil, client, channels, subscriptionMethod, t)
 		}
-		if withCallback {
-			cConfig = cConfig.WithCallback(callback, &callbackCtx)
-		}
-		client, err := suite.createAnyClientWithTesting(ClusterClient, cConfig)
-		require.NoError(t, err)
 		return client
 	default:
 		t.Fatalf("Unsupported client type")
 		return nil
+	}
+}
+
+func (suite *GlideTestSuite) subscribeByMethod(
+	standaloneClient *glide.Client,
+	clusterClient *glide.ClusterClient,
+	channels []ChannelDefn,
+	method SubscriptionMethod,
+	t *testing.T,
+) {
+	if method == ConfigMethod {
+		return // Already subscribed at creation
+	}
+
+	ctx := context.Background()
+	timeoutMs := 0
+
+	// Group channels by mode
+	exactChannels := []string{}
+	patternChannels := []string{}
+	shardedChannels := []string{}
+
+	for _, ch := range channels {
+		switch ch.Mode {
+		case ExactMode:
+			exactChannels = append(exactChannels, ch.Channel)
+		case PatternMode:
+			patternChannels = append(patternChannels, ch.Channel)
+		case ShardedMode:
+			shardedChannels = append(shardedChannels, ch.Channel)
+		}
+	}
+
+	// Subscribe based on method
+	if standaloneClient != nil {
+		if len(exactChannels) > 0 {
+			if method == LazyMethod {
+				require.NoError(t, standaloneClient.SubscribeLazy(ctx, exactChannels))
+			} else {
+				require.NoError(t, standaloneClient.Subscribe(ctx, exactChannels, timeoutMs))
+			}
+		}
+		if len(patternChannels) > 0 {
+			if method == LazyMethod {
+				require.NoError(t, standaloneClient.PSubscribeLazy(ctx, patternChannels))
+			} else {
+				require.NoError(t, standaloneClient.PSubscribe(ctx, patternChannels, timeoutMs))
+			}
+		}
+	} else if clusterClient != nil {
+		if len(exactChannels) > 0 {
+			if method == LazyMethod {
+				require.NoError(t, clusterClient.SubscribeLazy(ctx, exactChannels))
+			} else {
+				require.NoError(t, clusterClient.Subscribe(ctx, exactChannels, timeoutMs))
+			}
+		}
+		if len(patternChannels) > 0 {
+			if method == LazyMethod {
+				require.NoError(t, clusterClient.PSubscribeLazy(ctx, patternChannels))
+			} else {
+				require.NoError(t, clusterClient.PSubscribe(ctx, patternChannels, timeoutMs))
+			}
+		}
+		if len(shardedChannels) > 0 {
+			if method == LazyMethod {
+				require.NoError(t, clusterClient.SSubscribeLazy(ctx, shardedChannels))
+			} else {
+				require.NoError(t, clusterClient.SSubscribe(ctx, shardedChannels, timeoutMs))
+			}
+		}
+	}
+
+	// Only sleep for LazyMethod since BlockingMethod already waits for confirmation
+	if method == LazyMethod {
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 

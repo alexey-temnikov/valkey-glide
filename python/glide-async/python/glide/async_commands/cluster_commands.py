@@ -34,7 +34,7 @@ class ClusterCommands(CoreCommands):
     ) -> TClusterResponse[TResult]:
         """
         Executes a single command, without checking inputs.
-        See the [Valkey GLIDE Wiki](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#custom-command)
+        See the [Valkey GLIDE Documentation](https://glide.valkey.io/concepts/client-features/custom-commands/)
         for details on the restrictions and limitations of the custom command API.
 
         This function should only be used for single-response commands. Commands that don't return complete response and awaits
@@ -1256,7 +1256,7 @@ class ClusterCommands(CoreCommands):
         For each iteration, the new cursor object should be used to continue the scan.
         Using the same cursor object for multiple iterations will result in the same keys or unexpected behavior.
         For more information about the Cluster Scan implementation, see
-        [Cluster Scan](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#cluster-scan).
+        [Cluster Scan](https://glide.valkey.io/concepts/client-features/cluster-scan/).
 
         Like the SCAN command, the method can be used to iterate over the keys in the database,
         returning all keys the database has from when the scan started until the scan ends.
@@ -1518,6 +1518,7 @@ class ClusterCommands(CoreCommands):
 
         Raises:
             TimeoutError: If timeout > 0 and server confirmation not received within timeout.
+            ValueError: If timeout_ms is negative.
 
         Examples:
             >>> await client.ssubscribe({"shard_channel"})
@@ -1529,6 +1530,8 @@ class ClusterCommands(CoreCommands):
 
         Since: Valkey 7.0.0.
         """
+        if timeout_ms < 0:
+            raise ValueError(f"Timeout must be non-negative, got: {timeout_ms}")
         args = list(channels) + [str(timeout_ms)]
         await self._execute_command(RequestType.SSubscribeBlocking, list(args))
 
@@ -1568,32 +1571,38 @@ class ClusterCommands(CoreCommands):
         """
         Unsubscribe from sharded channels (blocking).
 
-        This command updates the client's internal desired subscription state and waits
-        for server confirmation.
+        This command updates the client's internal desired subscription state
+        and waits for server confirmation.
 
         Args:
             channels: A set of sharded channel names to unsubscribe from.
-                    If None, unsubscribes from all sharded channels.
-            timeout_ms: Maximum time in milliseconds to wait for server confirmation.
-                    A value of 0 (default) blocks indefinitely until confirmation.
+                    If None or ALL_SHARDED_CHANNELS, unsubscribes from all
+                    sharded channels.
+            timeout_ms: Maximum time in milliseconds to wait for server
+                    confirmation. A value of 0 (default) blocks indefinitely
+                    until confirmation.
 
         Returns: None
 
         Raises:
             TimeoutError: If timeout > 0 and server confirmation not received within timeout.
+            ValueError: If timeout_ms is negative.
 
         Examples:
             >>> await client.sunsubscribe({"shard_channel"})
-            >>> print("Unsubscribed from sharded channel successfully (waited indefinitely)")
+            >>> print("Unsubscribed from sharded channel successfully")
             >>>
             >>> # With timeout
-            >>> await client.sunsubscribe({"shard_channel"}, timeout=5.0)
-            >>> print("Unsubscribed from sharded channel successfully within 5 seconds")
+            >>> await client.sunsubscribe({"shard_channel"}, timeout_ms=5000)
+            >>> print("Unsubscribed from sharded channel successfully")
             >>>
             >>> # Unsubscribe from all sharded channels with timeout
-            >>> await client.sunsubscribe(timeout=10.0)
+            >>> from glide.async_commands.core import ALL_SHARDED_CHANNELS
+            >>> await client.sunsubscribe(ALL_SHARDED_CHANNELS, 10000)
 
         Since: Valkey 7.0.0.
         """
+        if timeout_ms < 0:
+            raise ValueError(f"Timeout must be non-negative, got: {timeout_ms}")
         args = (list(channels) if channels else []) + [str(timeout_ms)]
         await self._execute_command(RequestType.SUnsubscribeBlocking, list(args))

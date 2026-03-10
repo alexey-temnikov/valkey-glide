@@ -132,6 +132,9 @@ from .config import (
     TlsAdvancedConfiguration,
 )
 from .constants import (
+    ALL_CHANNELS,
+    ALL_PATTERNS,
+    ALL_SHARDED_CHANNELS,
     OK,
     TOK,
     FtAggregateResponse,
@@ -159,6 +162,11 @@ from .exceptions import (
     LoggerError,
     RequestError,
     TimeoutError,
+)
+from .opentelemetry import (
+    OpenTelemetryConfig,
+    OpenTelemetryMetricsConfig,
+    OpenTelemetryTracesConfig,
 )
 from .routes import (
     AllNodes,
@@ -278,6 +286,9 @@ __all__ = [
     "UpdateOptions",
     # PubSub
     "PubSubMsg",
+    "ALL_CHANNELS",
+    "ALL_PATTERNS",
+    "ALL_SHARDED_CHANNELS",
     # Json
     "json_batch",
     "JsonGetOptions",
@@ -331,4 +342,8 @@ __all__ = [
     "FtAggregateSortProperty",
     "FtProfileOptions",
     "QueryType",
+    # OpenTelemetry
+    "OpenTelemetryConfig",
+    "OpenTelemetryMetricsConfig",
+    "OpenTelemetryTracesConfig",
 ]

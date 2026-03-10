@@ -17,6 +17,7 @@ Examples:
         [{"a": 1.0, "b" :2}] # JSON object retrieved from the key `doc` using json.loads()
 
 """
+
 from typing import List, Optional, Union, cast
 
 from glide_shared.commands.core_options import ConditionalChange
@@ -129,7 +130,7 @@ async def get(
     if options:
         args.extend(options.get_options())
     if paths:
-        if isinstance(paths, (str, bytes)):
+        if isinstance(paths, (str, bytes, bytearray, memoryview)):
             paths = [paths]
         args.extend(paths)
 
