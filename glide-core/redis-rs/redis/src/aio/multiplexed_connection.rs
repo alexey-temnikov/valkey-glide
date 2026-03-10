@@ -84,7 +84,7 @@ struct PipelineMessage<S> {
 /// and `Sink`.
 #[derive(Clone)]
 pub(crate) struct Pipeline<SinkItem> {
-    sender: mpsc::Sender<PipelineMessage<SinkItem>>,
+    sender: mpsc::UnboundedSender<PipelineMessage<SinkItem>>,
     push_manager: Arc<ArcSwap<PushManager>>,
     is_stream_closed: Arc<AtomicBool>,
 }
@@ -340,8 +340,7 @@ where
         T::Error: Send,
         T::Error: ::std::fmt::Debug,
     {
-        const BUFFER_SIZE: usize = 50;
-        let (sender, mut receiver) = mpsc::channel(BUFFER_SIZE);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
         let push_manager: Arc<ArcSwap<PushManager>> =
             Arc::new(ArcSwap::new(Arc::new(PushManager::default())));
         let is_stream_closed = Arc::new(AtomicBool::new(false));
@@ -387,11 +386,7 @@ where
                 output: sender,
                 is_transaction: is_atomic,
             })
-            .await
             .map_err(|err| {
-                // If an error occurs here, it means the request never reached the server, as guaranteed
-                // by the 'send' function. Since the server did not receive the data, it is safe to retry
-                // the request.
                 RedisError::from((
                     crate::ErrorKind::FatalSendError,
                     "Failed to send the request to the server",
