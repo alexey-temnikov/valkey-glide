@@ -162,15 +162,6 @@ where
                         if futures::SinkExt::flush(&mut sink).await.is_err() {
                             break;
                         }
-                        // After recovery completes, drain any messages that arrived
-                        // during recovery and fail them immediately so callers don't
-                        // wait for the full try_request timeout.
-                        while let Ok(msg) = rx.try_recv() {
-                            let _ = msg.sender.send(Err(RedisError::from((
-                                ErrorKind::ClientError,
-                                "Connection in recovery",
-                            ))));
-                        }
                     }
                     let _ = futures::SinkExt::close(&mut sink).await;
                 };
