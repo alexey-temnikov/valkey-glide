@@ -1208,8 +1208,11 @@ async fn create_cluster_client(
         None => Some(DEFAULT_PERIODIC_TOPOLOGY_CHECKS_INTERVAL),
     };
     let connection_timeout = to_duration(request.connection_timeout, DEFAULT_CONNECTION_TIMEOUT);
+    let request_timeout = to_duration(request.request_timeout, DEFAULT_RESPONSE_TIMEOUT);
+    let per_attempt_timeout = (request_timeout / 20).max(Duration::from_millis(50));
     let mut builder = redis::cluster::ClusterClientBuilder::new(initial_nodes)
-        .connection_timeout(connection_timeout)
+        .connection_timeout(connection_timeout.min(per_attempt_timeout))
+        .response_timeout(per_attempt_timeout)
         .retries(DEFAULT_RETRIES);
     let read_from_strategy = request.read_from.unwrap_or_default();
     builder = builder.read_from(match read_from_strategy {

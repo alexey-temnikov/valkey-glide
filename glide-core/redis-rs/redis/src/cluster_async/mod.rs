@@ -1127,6 +1127,21 @@ impl<C> ClusterConnInner<C>
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
+    /// Fail all pending requests immediately with ClientError (NoRetry).
+    /// Called when entering recovery to prevent requests from waiting
+    /// for slow reconnection cycles.
+    fn fail_pending_requests(inner: &Core<C>) {
+        let mut guard = inner.pending_requests.lock().unwrap();
+        let requests = std::mem::take(&mut *guard);
+        drop(guard);
+        for request in requests {
+            let _ = request.sender.send(Err(RedisError::from((
+                ErrorKind::ClientError,
+                "Connection in recovery",
+            ))));
+        }
+    }
+
     async fn new(
         initial_nodes: &[ConnectionInfo],
         cluster_params: ClusterParams,
@@ -3428,6 +3443,7 @@ where
             match ready!(self.poll_complete(cx)) {
                 PollFlushAction::None => return Poll::Ready(Ok(())),
                 PollFlushAction::RebuildSlots => {
+                    ClusterConnInner::fail_pending_requests(&self.inner);
                     // Spawn refresh task
                     let task_handle = ClusterConnInner::spawn_refresh_slots_task(
                         self.inner.clone(),
@@ -3439,12 +3455,14 @@ where
                         ConnectionState::Recover(RecoverFuture::RefreshingSlots(task_handle));
                 }
                 PollFlushAction::ReconnectFromInitialConnections => {
+                    ClusterConnInner::fail_pending_requests(&self.inner);
                     self.state =
                         ConnectionState::Recover(RecoverFuture::ReconnectToInitialNodes(Box::pin(
                             ClusterConnInner::reconnect_to_initial_nodes(self.inner.clone()),
                         )));
                 }
                 PollFlushAction::Reconnect(addresses) => {
+                    ClusterConnInner::fail_pending_requests(&self.inner);
                     self.state = ConnectionState::Recover(RecoverFuture::Reconnect(Box::pin(
                         ClusterConnInner::trigger_refresh_connection_tasks(
                             self.inner.clone(),
