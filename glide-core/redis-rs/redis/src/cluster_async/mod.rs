@@ -129,7 +129,7 @@ const MUTEX_WRITE_ERR: &str = "Failed to obtain write lock. Poisoned mutex?";
 /// underlying connections maintained for each node in the cluster, as well
 /// as common parameters for connecting to nodes and executing commands.
 #[derive(Clone)]
-pub struct ClusterConnection<C = MultiplexedConnection>(mpsc::Sender<Message<C>>);
+pub struct ClusterConnection<C = MultiplexedConnection>(mpsc::UnboundedSender<Message<C>>);
 
 impl<C> ClusterConnection<C>
 where
@@ -143,7 +143,7 @@ where
         ClusterConnInner::new(initial_nodes, cluster_params, push_sender)
             .await
             .map(|inner| {
-                let (tx, mut rx) = mpsc::channel::<Message<_>>(100);
+                let (tx, mut rx) = mpsc::unbounded_channel::<Message<_>>();
                 let stream = async move {
                     let _ = stream::poll_fn(move |cx| rx.poll_recv(cx))
                         .map(Ok)
@@ -225,7 +225,6 @@ where
                 cmd: CmdArg::ClusterScan { cluster_scan_args },
                 sender,
             })
-            .await
             .map_err(|e| {
                 RedisError::from(io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -262,7 +261,6 @@ where
                 },
                 sender,
             })
-            .await
             .map_err(|e| {
                 RedisError::from(io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -311,7 +309,6 @@ where
                 },
                 sender,
             })
-            .await
             .map_err(|err| {
                 RedisError::from(io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))
             })?;
@@ -369,7 +366,6 @@ where
                 cmd: CmdArg::OperationRequest(operation_request),
                 sender,
             })
-            .await
             .map_err(|_| RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))?;
 
         receiver
