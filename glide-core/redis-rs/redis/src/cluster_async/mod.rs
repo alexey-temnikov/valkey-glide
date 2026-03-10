@@ -3088,20 +3088,17 @@ where
 
         match recover_future {
             RecoverFuture::RefreshingSlots(handle) => {
-                // Check if the task has completed
-                match handle.now_or_never() {
-                    Some(Ok(Ok(()))) => {
-                        // Task succeeded
+                match Pin::new(handle).poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(Ok(()))) => {
                         trace!("Slot refresh completed successfully!");
                         self.state = ConnectionState::PollComplete;
                         return Poll::Ready(Ok(()));
                     }
-                    Some(Ok(Err(e))) => {
-                        // Task completed but returned an engine error
+                    Poll::Ready(Ok(Err(e))) => {
                         trace!("Slot refresh failed: {:?}", e);
 
                         if e.kind() == ErrorKind::AllConnectionsUnavailable {
-                            // If all connections unavailable, try reconnect
                             self.state =
                                 ConnectionState::Recover(RecoverFuture::ReconnectToInitialNodes(
                                     Box::pin(ClusterConnInner::reconnect_to_initial_nodes(
@@ -3110,7 +3107,6 @@ where
                                 ));
                             return Poll::Ready(Err(e));
                         } else {
-                            // Retry refresh
                             let new_handle = Self::spawn_refresh_slots_task(
                                 self.inner.clone(),
                                 &RefreshPolicy::Throttable,
@@ -3121,27 +3117,19 @@ where
                             return Poll::Ready(Ok(()));
                         }
                     }
-                    Some(Err(join_err)) => {
+                    Poll::Ready(Err(join_err)) => {
                         if join_err.is_cancelled() {
-                            // Task was intentionally aborted - don't treat as an error
                             trace!("Slot refresh task was aborted");
                             self.state = ConnectionState::PollComplete;
                             return Poll::Ready(Ok(()));
                         } else {
-                            // Task panicked - try reconnecting to initial nodes as a recovery strategy
                             warn!("Slot refresh task panicked: {:?} - attempting recovery by reconnecting to initial nodes", join_err);
-
-                            // TODO - consider a gracefully closing of the client
-                            // Since a panic indicates a bug in the refresh logic,
-                            // it might be safer to close the client entirely
                             self.state =
                                 ConnectionState::Recover(RecoverFuture::ReconnectToInitialNodes(
                                     Box::pin(ClusterConnInner::reconnect_to_initial_nodes(
                                         self.inner.clone(),
                                     )),
                                 ));
-
-                            // Report this critical error to clients
                             let err = RedisError::from((
                                 ErrorKind::ClientError,
                                 "Slot refresh task panicked",
@@ -3150,14 +3138,7 @@ where
                             return Poll::Ready(Err(err));
                         }
                     }
-                    None => {
-                        // Task is still running
-                        // Just continue and return Ok to not block poll_flush
-                    }
                 }
-
-                // Always return Ready to not block poll_flush
-                Poll::Ready(Ok(()))
             }
             // Other cases remain unchanged
             RecoverFuture::ReconnectToInitialNodes(ref mut future) => {
