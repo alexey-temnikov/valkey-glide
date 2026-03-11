@@ -3483,7 +3483,6 @@ where
             }
             Poll::Ready(PollFlushAction::RebuildSlots) => {
                 POLL_COMPLETE_READY.fetch_add(1, AtomicOrdering::Relaxed);
-                ClusterConnInner::fail_pending_requests(&self.inner);
                 let task_handle = ClusterConnInner::spawn_refresh_slots_task(
                     self.inner.clone(),
                     &RefreshPolicy::Throttable,
@@ -3495,7 +3494,6 @@ where
             }
             Poll::Ready(PollFlushAction::ReconnectFromInitialConnections) => {
                 POLL_COMPLETE_READY.fetch_add(1, AtomicOrdering::Relaxed);
-                ClusterConnInner::fail_pending_requests(&self.inner);
                 self.state =
                     ConnectionState::Recover(RecoverFuture::ReconnectToInitialNodes(Box::pin(
                         ClusterConnInner::reconnect_to_initial_nodes(self.inner.clone()),
@@ -3505,7 +3503,6 @@ where
             }
             Poll::Ready(PollFlushAction::Reconnect(addresses)) => {
                 POLL_COMPLETE_READY.fetch_add(1, AtomicOrdering::Relaxed);
-                ClusterConnInner::fail_pending_requests(&self.inner);
                 self.state = ConnectionState::Recover(RecoverFuture::Reconnect(Box::pin(
                     ClusterConnInner::trigger_refresh_connection_tasks(
                         self.inner.clone(),
