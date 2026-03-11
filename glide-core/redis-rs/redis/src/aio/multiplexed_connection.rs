@@ -380,24 +380,42 @@ where
     ) -> Result<Value, RedisError> {
         let (sender, receiver) = oneshot::channel();
 
-        self.sender
-            .send(PipelineMessage {
+        // Use send() with a 100ms timeout instead of send().await (unbounded wait).
+        // The pipeline channel is bounded (50 slots). Under normal operation, a slot
+        // frees in microseconds as the pipeline driver drains the channel. If the
+        // channel is still full after 100ms, the connection is likely dead (e.g.,
+        // half-open TCP from a network partition). Without this timeout, send().await
+        // blocks the calling task indefinitely, which starves the single-threaded
+        // Tokio runtime and prevents all timers (request_timeout, response_timeout)
+        // from firing — causing CompletableFuture.get() to hang forever in Java.
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            self.sender.send(PipelineMessage {
                 input,
                 pipeline_response_count,
                 output: sender,
                 is_transaction: is_atomic,
-            })
-            .await
-            .map_err(|err| {
-                // If an error occurs here, it means the request never reached the server, as guaranteed
-                // by the 'send' function. Since the server did not receive the data, it is safe to retry
-                // the request.
-                RedisError::from((
+            }),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                return Err(RedisError::from((
                     crate::ErrorKind::FatalSendError,
                     "Failed to send the request to the server",
                     err.to_string(),
-                ))
-            })?;
+                )));
+            }
+            Err(_elapsed) => {
+                // tokio::time::timeout expired — pipeline channel was full for 100ms,
+                // meaning the pipeline driver is stuck (likely dead TCP connection).
+                return Err(RedisError::from((
+                    crate::ErrorKind::FatalSendError,
+                    "Pipeline channel full for 100ms — connection likely dead",
+                )));
+            }
+        }
         match Runtime::locate().timeout(timeout, receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(err)) => {
