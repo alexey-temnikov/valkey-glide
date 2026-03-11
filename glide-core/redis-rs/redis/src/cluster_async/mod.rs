@@ -110,6 +110,43 @@ use dispose::{Disposable, Dispose};
 use futures::{future::BoxFuture, prelude::*, ready};
 use pin_project_lite::pin_project;
 use std::sync::RwLock as StdRwLock;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+// Diagnostic counters for detecting poll_flush busy-spin during partition.
+pub(crate) static POLL_FLUSH_CALLS: AtomicU64 = AtomicU64::new(0);
+static POLL_RECOVER_READY: AtomicU64 = AtomicU64::new(0);
+static POLL_RECOVER_PENDING: AtomicU64 = AtomicU64::new(0);
+static POLL_COMPLETE_READY: AtomicU64 = AtomicU64::new(0);
+static POLL_COMPLETE_PENDING: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PIPELINE_SEND_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LAST_DIAG_LOG: AtomicU64 = AtomicU64::new(0);
+pub(crate) use std::sync::atomic::Ordering as DiagOrdering;
+
+fn log_diag_counters() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let last = LAST_DIAG_LOG.load(AtomicOrdering::Relaxed);
+    if now.saturating_sub(last) < 5 {
+        return;
+    }
+    if LAST_DIAG_LOG.compare_exchange(last, now, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed).is_err() {
+        return;
+    }
+    let flush = POLL_FLUSH_CALLS.swap(0, AtomicOrdering::Relaxed);
+    let rec_ready = POLL_RECOVER_READY.swap(0, AtomicOrdering::Relaxed);
+    let rec_pend = POLL_RECOVER_PENDING.swap(0, AtomicOrdering::Relaxed);
+    let comp_ready = POLL_COMPLETE_READY.swap(0, AtomicOrdering::Relaxed);
+    let comp_pend = POLL_COMPLETE_PENDING.swap(0, AtomicOrdering::Relaxed);
+    let send_to = PIPELINE_SEND_TIMEOUT.swap(0, AtomicOrdering::Relaxed);
+    if flush > 0 {
+        warn!(
+            "DIAG poll_flush={} recover(ready={},pending={}) complete(ready={},pending={}) pipe_send_timeout={}",
+            flush, rec_ready, rec_pend, comp_ready, comp_pend, send_to
+        );
+    }
+}
 use tokio::sync::{
     mpsc,
     oneshot::{self, Receiver},
@@ -154,6 +191,19 @@ where
                 tokio::spawn(stream);
                 ClusterConnection(tx)
             })
+    }
+
+    /// Send a message to the cluster task. Uses regular send().await
+    /// to preserve backpressure — the cluster task needs quiet windows
+    /// during recovery to refresh connections. Fast error delivery is
+    /// handled by fail_pending_requests inside poll_flush instead.
+    async fn send_msg(&self, msg: Message<C>) -> RedisResult<()> {
+        self.0.send(msg).await.map_err(|e| {
+            RedisError::from(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("Cluster channel closed: {e:?}"),
+            ))
+        })
     }
 
     /// Special handling for `SCAN` command, using `cluster_scan_with_pattern`.
@@ -220,18 +270,10 @@ where
         cluster_scan_args: ClusterScanArgs,
     ) -> RedisResult<(ScanStateRC, Vec<Value>)> {
         let (sender, receiver) = oneshot::channel();
-        self.0
-            .send(Message {
+        self.send_msg(Message {
                 cmd: CmdArg::ClusterScan { cluster_scan_args },
                 sender,
-            })
-            .await
-            .map_err(|e| {
-                RedisError::from(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    format!("Cluster: Error occurred while trying to send SCAN command to internal send task. {e:?}"),
-                ))
-            })?;
+            }).await?;
         receiver
             .await
             .unwrap_or_else(|e| {
@@ -254,21 +296,13 @@ where
     ) -> RedisResult<Value> {
         trace!("route_command");
         let (sender, receiver) = oneshot::channel();
-        self.0
-            .send(Message {
+        self.send_msg(Message {
                 cmd: CmdArg::Cmd {
                     cmd: Arc::new(cmd.clone()),
                     routing: routing.into(),
                 },
                 sender,
-            })
-            .await
-            .map_err(|e| {
-                RedisError::from(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    format!("Cluster: Error occurred while trying to send command to internal sender. {e:?}"),
-                ))
-            })?;
+            }).await?;
         receiver
             .await
             .unwrap_or_else(|e| {
@@ -299,8 +333,7 @@ where
         pipeline_retry_strategy: Option<PipelineRetryStrategy>,
     ) -> RedisResult<Vec<Value>> {
         let (sender, receiver) = oneshot::channel();
-        self.0
-            .send(Message {
+        self.send_msg(Message {
                 cmd: CmdArg::Pipeline {
                     pipeline: Arc::new(pipeline.clone()),
                     offset,
@@ -310,11 +343,7 @@ where
                     pipeline_retry_strategy: pipeline_retry_strategy.unwrap_or_default(),
                 },
                 sender,
-            })
-            .await
-            .map_err(|err| {
-                RedisError::from(io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))
-            })?;
+            }).await?;
 
         receiver
             .await
@@ -364,13 +393,10 @@ where
         operation_request: Operation,
     ) -> RedisResult<Value> {
         let (sender, receiver) = oneshot::channel();
-        self.0
-            .send(Message {
+        self.send_msg(Message {
                 cmd: CmdArg::OperationRequest(operation_request),
                 sender,
-            })
-            .await
-            .map_err(|_| RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))?;
+            }).await?;
 
         receiver
             .await
@@ -3077,29 +3103,30 @@ where
 
         match recover_future {
             RecoverFuture::RefreshingSlots(handle) => {
-                // Check if the task has completed
-                match handle.now_or_never() {
-                    Some(Ok(Ok(()))) => {
-                        // Task succeeded
+                // Use proper poll() instead of now_or_never() to register the waker.
+                // now_or_never() consumes the future without registering a waker, so
+                // when the task is still running it returns None and we'd fall through
+                // to Ready(Ok(())) — telling poll_flush recovery is done when it isn't.
+                // This caused a busy-spin loop in poll_flush.
+                match Pin::new(handle).poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(Ok(()))) => {
                         trace!("Slot refresh completed successfully!");
                         self.state = ConnectionState::PollComplete;
-                        return Poll::Ready(Ok(()));
+                        Poll::Ready(Ok(()))
                     }
-                    Some(Ok(Err(e))) => {
-                        // Task completed but returned an engine error
+                    Poll::Ready(Ok(Err(e))) => {
                         trace!("Slot refresh failed: {:?}", e);
 
                         if e.kind() == ErrorKind::AllConnectionsUnavailable {
-                            // If all connections unavailable, try reconnect
                             self.state =
                                 ConnectionState::Recover(RecoverFuture::ReconnectToInitialNodes(
                                     Box::pin(ClusterConnInner::reconnect_to_initial_nodes(
                                         self.inner.clone(),
                                     )),
                                 ));
-                            return Poll::Ready(Err(e));
+                            Poll::Ready(Err(e))
                         } else {
-                            // Retry refresh
                             let new_handle = Self::spawn_refresh_slots_task(
                                 self.inner.clone(),
                                 &RefreshPolicy::Throttable,
@@ -3107,46 +3134,31 @@ where
                             self.state = ConnectionState::Recover(RecoverFuture::RefreshingSlots(
                                 new_handle,
                             ));
-                            return Poll::Ready(Ok(()));
+                            Poll::Ready(Ok(()))
                         }
                     }
-                    Some(Err(join_err)) => {
+                    Poll::Ready(Err(join_err)) => {
                         if join_err.is_cancelled() {
-                            // Task was intentionally aborted - don't treat as an error
                             trace!("Slot refresh task was aborted");
                             self.state = ConnectionState::PollComplete;
-                            return Poll::Ready(Ok(()));
+                            Poll::Ready(Ok(()))
                         } else {
-                            // Task panicked - try reconnecting to initial nodes as a recovery strategy
                             warn!("Slot refresh task panicked: {:?} - attempting recovery by reconnecting to initial nodes", join_err);
-
-                            // TODO - consider a gracefully closing of the client
-                            // Since a panic indicates a bug in the refresh logic,
-                            // it might be safer to close the client entirely
                             self.state =
                                 ConnectionState::Recover(RecoverFuture::ReconnectToInitialNodes(
                                     Box::pin(ClusterConnInner::reconnect_to_initial_nodes(
                                         self.inner.clone(),
                                     )),
                                 ));
-
-                            // Report this critical error to clients
                             let err = RedisError::from((
                                 ErrorKind::ClientError,
                                 "Slot refresh task panicked",
                                 format!("{join_err:?}"),
                             ));
-                            return Poll::Ready(Err(err));
+                            Poll::Ready(Err(err))
                         }
                     }
-                    None => {
-                        // Task is still running
-                        // Just continue and return Ok to not block poll_flush
-                    }
                 }
-
-                // Always return Ready to not block poll_flush
-                Poll::Ready(Ok(()))
             }
             // Other cases remain unchanged
             RecoverFuture::ReconnectToInitialNodes(ref mut future) => {
@@ -3201,6 +3213,22 @@ where
         }
     }
 
+    /// Fail all pending requests immediately with ClientError.
+    /// Called when entering recovery to prevent requests from waiting
+    /// for slow reconnection cycles. The error maps to NoRetry so
+    /// callers get fast errors without triggering more reconnections.
+    fn fail_pending_requests(inner: &Core<C>) {
+        let mut guard = inner.pending_requests.lock().unwrap();
+        let requests = std::mem::take(&mut *guard);
+        drop(guard);
+        for request in requests {
+            let _ = request.sender.send(Err(RedisError::from((
+                ErrorKind::ClientError,
+                "Connection in recovery",
+            ))));
+        }
+    }
+
     fn poll_complete(&mut self, cx: &mut task::Context<'_>) -> Poll<PollFlushAction> {
         let retry_params = self
             .inner
@@ -3208,6 +3236,11 @@ where
             .expect(MUTEX_READ_ERR);
         let mut poll_flush_action = PollFlushAction::None;
         let mut pending_requests_guard = self.inner.pending_requests.lock().unwrap();
+        let pending_count = pending_requests_guard.len();
+        let inflight_count = self.in_flight_requests.len();
+        if pending_count > 0 || inflight_count > 0 {
+            trace!("poll_complete: pending={} inflight={}", pending_count, inflight_count);
+        }
         if !pending_requests_guard.is_empty() {
             let mut pending_requests = mem::take(&mut *pending_requests_guard);
             for request in pending_requests.drain(..) {
@@ -3409,52 +3442,81 @@ where
         cx: &mut task::Context,
     ) -> Poll<Result<(), Self::Error>> {
         trace!("poll_flush: {:?}", self.state);
-        loop {
-            self.send_refresh_error();
+        POLL_FLUSH_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+        log_diag_counters();
+        // No loop{} here — when recovery is needed, we enter recovery state and
+        // return Pending. The batch-drain loop will re-call flush() which re-polls
+        // us. This prevents busy-spinning the single-threaded Tokio runtime during
+        // sustained partition, allowing timers and other tasks to make progress.
+        self.send_refresh_error();
 
-            if let Err(err) = ready!(self.as_mut().poll_recover(cx)) {
-                // We failed to reconnect, while we will try again we will report the
-                // error if we can to avoid getting trapped in an infinite loop of
-                // trying to reconnect
+        match self.as_mut().poll_recover(cx) {
+            Poll::Pending => {
+                POLL_RECOVER_PENDING.fetch_add(1, AtomicOrdering::Relaxed);
+                // Fail any requests that Forward put into pending_requests
+                // via start_send while we're in recovery. Without this,
+                // those requests wait for recovery to complete (~seconds),
+                // blocking Java threads on run_with_timeout (1000ms).
+                ClusterConnInner::fail_pending_requests(&self.inner);
+                return Poll::Pending;
+            }
+            Poll::Ready(Err(err)) => {
+                POLL_RECOVER_READY.fetch_add(1, AtomicOrdering::Relaxed);
                 self.refresh_error = Some(err);
-
-                // Give other tasks a chance to progress before we try to recover
-                // again. Since the future may not have registered a wake up we do so
-                // now so the task is not forgotten
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
+            Poll::Ready(Ok(())) => {
+                POLL_RECOVER_READY.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
 
-            match ready!(self.poll_complete(cx)) {
-                PollFlushAction::None => return Poll::Ready(Ok(())),
-                PollFlushAction::RebuildSlots => {
-                    // Spawn refresh task
-                    let task_handle = ClusterConnInner::spawn_refresh_slots_task(
-                        self.inner.clone(),
-                        &RefreshPolicy::Throttable,
-                    );
-
-                    // Update state
-                    self.state =
-                        ConnectionState::Recover(RecoverFuture::RefreshingSlots(task_handle));
-                }
-                PollFlushAction::ReconnectFromInitialConnections => {
-                    self.state =
-                        ConnectionState::Recover(RecoverFuture::ReconnectToInitialNodes(Box::pin(
-                            ClusterConnInner::reconnect_to_initial_nodes(self.inner.clone()),
-                        )));
-                }
-                PollFlushAction::Reconnect(addresses) => {
-                    self.state = ConnectionState::Recover(RecoverFuture::Reconnect(Box::pin(
-                        ClusterConnInner::trigger_refresh_connection_tasks(
-                            self.inner.clone(),
-                            addresses,
-                            RefreshConnectionType::OnlyUserConnection,
-                            true,
-                        )
-                        .map(|_| ()), // Convert Vec<Arc<Notify>> to () as it's not needed here
+        let poll_complete_result = self.as_mut().poll_complete(cx);
+        match poll_complete_result {
+            Poll::Pending => {
+                POLL_COMPLETE_PENDING.fetch_add(1, AtomicOrdering::Relaxed);
+                return Poll::Pending;
+            }
+            Poll::Ready(PollFlushAction::None) => {
+                POLL_COMPLETE_READY.fetch_add(1, AtomicOrdering::Relaxed);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(PollFlushAction::RebuildSlots) => {
+                POLL_COMPLETE_READY.fetch_add(1, AtomicOrdering::Relaxed);
+                ClusterConnInner::fail_pending_requests(&self.inner);
+                let task_handle = ClusterConnInner::spawn_refresh_slots_task(
+                    self.inner.clone(),
+                    &RefreshPolicy::Throttable,
+                );
+                self.state =
+                    ConnectionState::Recover(RecoverFuture::RefreshingSlots(task_handle));
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Poll::Ready(PollFlushAction::ReconnectFromInitialConnections) => {
+                POLL_COMPLETE_READY.fetch_add(1, AtomicOrdering::Relaxed);
+                ClusterConnInner::fail_pending_requests(&self.inner);
+                self.state =
+                    ConnectionState::Recover(RecoverFuture::ReconnectToInitialNodes(Box::pin(
+                        ClusterConnInner::reconnect_to_initial_nodes(self.inner.clone()),
                     )));
-                }
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Poll::Ready(PollFlushAction::Reconnect(addresses)) => {
+                POLL_COMPLETE_READY.fetch_add(1, AtomicOrdering::Relaxed);
+                ClusterConnInner::fail_pending_requests(&self.inner);
+                self.state = ConnectionState::Recover(RecoverFuture::Reconnect(Box::pin(
+                    ClusterConnInner::trigger_refresh_connection_tasks(
+                        self.inner.clone(),
+                        addresses,
+                        RefreshConnectionType::OnlyUserConnection,
+                        true,
+                    )
+                    .map(|_| ()),
+                )));
+                cx.waker().wake_by_ref();
+                Poll::Pending
             }
         }
     }

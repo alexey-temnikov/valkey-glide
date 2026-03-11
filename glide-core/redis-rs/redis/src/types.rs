@@ -1143,6 +1143,11 @@ impl RedisError {
 
                     io::ErrorKind::PermissionDenied => RetryMethod::NoRetry,
                     io::ErrorKind::Unsupported => RetryMethod::NoRetry,
+                    // Response timeouts are returned to the caller without triggering
+                    // reconnection. During network partition, dead connections are
+                    // recovered via FatalSendError (pipeline send timeout) which maps
+                    // to ReconnectAndRetry. Using Reconnect here would cause
+                    // reconnection storms from normal latency jitter.
                     io::ErrorKind::TimedOut => RetryMethod::NoRetry,
 
                     _ => RetryMethod::RetryImmediately,
