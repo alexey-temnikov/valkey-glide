@@ -407,7 +407,9 @@ where
                     err.to_string(),
                 )));
             }
-            Err(_) => {
+            Err(_elapsed) => {
+                // tokio::time::timeout expired — pipeline channel was full for 100ms,
+                // meaning the pipeline driver is stuck (likely dead TCP connection).
                 return Err(RedisError::from((
                     crate::ErrorKind::FatalSendError,
                     "Pipeline channel full for 100ms — connection likely dead",
