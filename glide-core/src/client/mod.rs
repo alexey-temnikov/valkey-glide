@@ -250,10 +250,6 @@ async fn run_with_timeout<T>(
         Some(duration) => match tokio::time::timeout(duration, future).await {
             Ok(result) => result,
             Err(_) => {
-                log_warn(
-                    "run_with_timeout",
-                    format!("request timed out after {}ms", duration.as_millis()),
-                );
                 // Record timeout error metric if telemetry is initialized
                 if let Err(e) = GlideOpenTelemetry::record_timeout_error() {
                     log_error(
@@ -1219,8 +1215,7 @@ async fn create_cluster_client(
         // This ensures requests already in the pipeline fail within 500ms
         // (for 1000ms request_timeout) instead of waiting for TCP retransmit
         // timeout (~6.5 minutes). The /2 factor leaves room for one retry
-        // within the overall request_timeout budget while being generous
-        // enough for initial cluster topology discovery and TLS handshakes.
+        // within the overall request_timeout budget.
         .response_timeout(to_duration(request.request_timeout, DEFAULT_RESPONSE_TIMEOUT) / 2)
         .retries(DEFAULT_RETRIES);
     let read_from_strategy = request.read_from.unwrap_or_default();

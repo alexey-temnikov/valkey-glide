@@ -1,5 +1,4 @@
 use super::{ConnectionLike, Runtime};
-use tracing::warn;
 use crate::aio::setup_connection;
 use crate::aio::DisconnectNotifier;
 use crate::client::GlideConnectionOptions;
@@ -409,7 +408,6 @@ where
                 )));
             }
             Err(_) => {
-                crate::cluster_async::PIPELINE_SEND_TIMEOUT.fetch_add(1, crate::cluster_async::DiagOrdering::Relaxed);
                 return Err(RedisError::from((
                     crate::ErrorKind::FatalSendError,
                     "Pipeline channel full for 100ms — connection likely dead",
@@ -428,10 +426,7 @@ where
                     err.to_string(),
                 )))
             }
-            Err(elapsed) => {
-                warn!("send_recv: response_timeout fired after {}ms", timeout.as_millis());
-                Err(elapsed.into())
-            }
+            Err(elapsed) => Err(elapsed.into()),
         }
     }
 
