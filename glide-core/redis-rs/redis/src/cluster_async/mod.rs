@@ -161,17 +161,250 @@ where
         ClusterConnInner::new(initial_nodes, cluster_params, push_sender)
             .await
             .map(|inner| {
-                let (tx, mut rx) = mpsc::channel::<Message<_>>(100);
-                let stream = async move {
-                    let _ = stream::poll_fn(move |cx| rx.poll_recv(cx))
-                        .map(Ok)
-                        .forward(inner)
-                        .await;
-                };
+                let (tx, rx) = mpsc::channel::<Message<_>>(100);
                 #[cfg(feature = "tokio-comp")]
-                spawn_named("cluster-forward", stream);
+                spawn_named("cluster-forward", Self::cluster_task(inner, rx));
                 ClusterConnection(tx)
             })
+    }
+
+    /// The main cluster routing task. Replaces the forward+Sink pattern with
+    /// a select! loop that separates write (route+send) from read (response).
+    /// Each in-flight request is a single oneshot::Receiver (1 wake) instead
+    /// of a full try_request future in FuturesUnordered (~4 wakes).
+    async fn cluster_task(
+        mut inner: Disposable<ClusterConnInner<C>>,
+        mut rx: mpsc::Receiver<Message<C>>,
+    ) {
+        // In-flight responses: each future is just an oneshot::Receiver wait (1 yield).
+        type InFlightResult<C> = (PendingRequest<C>, String, RedisResult<Value>);
+        let mut in_flight: stream::FuturesUnordered<
+            Pin<Box<dyn Future<Output = InFlightResult<C>> + Send>>,
+        > = stream::FuturesUnordered::new();
+
+        // Recovery future: None when healthy, Some when recovering.
+        let mut recovery: Option<Pin<Box<dyn Future<Output = RedisResult<()>> + Send>>> = None;
+
+        loop {
+            // If recovering, drain channel and fail new requests immediately.
+            if recovery.is_some() {
+                tokio::select! {
+                    biased;
+                    // Drive recovery to completion
+                    result = async { recovery.as_mut().unwrap().as_mut().await }, if recovery.is_some() => {
+                        if let Err(err) = result {
+                            warn!("Recovery failed: {:?}. Retrying.", err);
+                            // Retry recovery: refresh slots
+                            recovery = Some(Box::pin(
+                                ClusterConnInner::refresh_slots_and_subscriptions_with_retries(
+                                    inner.inner.clone(),
+                                    &RefreshPolicy::NotThrottable,
+                                    SlotRefreshTrigger::RuntimeRefresh,
+                                ).map(|r| r.map(|_| ()))
+                            ));
+                            continue;
+                        }
+                        trace!("Recovery complete");
+                        recovery = None;
+                    }
+                    // Fail new requests during recovery
+                    msg = rx.recv() => {
+                        match msg {
+                            Some(Message { sender, .. }) => {
+                                let _ = sender.send(Err(RedisError::from((
+                                    ErrorKind::ClientError,
+                                    "Connection in recovery",
+                                ))));
+                            }
+                            None => return, // channel closed
+                        }
+                    }
+                    // Still process in-flight responses during recovery
+                    Some((request, address, result)) = in_flight.next() => {
+                        let retry_params = inner.inner
+                            .get_cluster_param(|p| p.retry_params.clone())
+                            .expect(MUTEX_READ_ERR);
+                        let in_flight_req = InFlightRequest { receiver: oneshot::channel().1, request, address };
+                        match handle_response(in_flight_req, result, &retry_params) {
+                            ResponseAction::Done => {}
+                            ResponseAction::Retry { request } => {
+                                // Can't retry during recovery — fail it
+                                let _ = request.sender.send(Err(RedisError::from((
+                                    ErrorKind::ClientError,
+                                    "Connection in recovery",
+                                ))));
+                            }
+                            _ => {} // Recovery already in progress
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Normal operation
+            tokio::select! {
+                biased;
+                // Process completed responses (read path)
+                Some((request, address, result)) = in_flight.next() => {
+                    let retry_params = inner.inner
+                        .get_cluster_param(|p| p.retry_params.clone())
+                        .expect(MUTEX_READ_ERR);
+                    let in_flight_req = InFlightRequest {
+                        receiver: oneshot::channel().1, // dummy, already consumed
+                        request,
+                        address: address.clone(),
+                    };
+                    match handle_response(in_flight_req, result, &retry_params) {
+                        ResponseAction::Done => {}
+                        ResponseAction::Retry { request } => {
+                            Self::dispatch_request(inner.inner.clone(), request, &mut in_flight).await;
+                        }
+                        ResponseAction::RefreshSlots { request, moved_redirect } => {
+                            if let Some(redirect) = moved_redirect {
+                                let _ = ClusterConnInner::update_upon_moved_error(
+                                    inner.inner.clone(), redirect.slot, redirect.address.into(),
+                                ).await;
+                            }
+                            recovery = Some(Box::pin(
+                                ClusterConnInner::refresh_slots_and_subscriptions_with_retries(
+                                    inner.inner.clone(),
+                                    &RefreshPolicy::Throttable,
+                                    SlotRefreshTrigger::RuntimeRefresh,
+                                ).map(|r| r.map(|_| ()))
+                            ));
+                            // Re-queue the request for retry after recovery
+                            if let Some(request) = request {
+                                inner.inner.pending_requests.lock().unwrap().push(request);
+                            }
+                        }
+                        ResponseAction::Reconnect { request, target } => {
+                            recovery = Some(Box::pin(
+                                ClusterConnInner::trigger_refresh_connection_tasks(
+                                    inner.inner.clone(),
+                                    HashSet::from_iter([target]),
+                                    RefreshConnectionType::OnlyUserConnection,
+                                    true,
+                                ).map(|_| Ok(()))
+                            ));
+                            if let Some(request) = request {
+                                inner.inner.pending_requests.lock().unwrap().push(request);
+                            }
+                        }
+                        ResponseAction::ReconnectToInitialNodes { request } => {
+                            recovery = Some(Box::pin(
+                                ClusterConnInner::reconnect_to_initial_nodes(inner.inner.clone())
+                                    .map(|_| Ok(()))
+                            ));
+                            if let Some(request) = request {
+                                inner.inner.pending_requests.lock().unwrap().push(request);
+                            }
+                        }
+                    }
+                }
+                // Accept new commands (write path)
+                msg = rx.recv() => {
+                    match msg {
+                        Some(Message { cmd, sender }) => {
+                            let request = PendingRequest {
+                                retry: 0,
+                                sender,
+                                info: RequestInfo { cmd },
+                            };
+                            Self::dispatch_request(inner.inner.clone(), request, &mut in_flight).await;
+
+                            // Drain any pending_requests (from retries)
+                            let pending: Vec<_> = {
+                                let mut guard = inner.inner.pending_requests.lock().unwrap();
+                                std::mem::take(&mut *guard)
+                            };
+                            for req in pending {
+                                Self::dispatch_request(inner.inner.clone(), req, &mut in_flight).await;
+                            }
+                        }
+                        None => return, // channel closed
+                    }
+                }
+            }
+        }
+    }
+
+    /// Route a request and add it to the in-flight collection.
+    async fn dispatch_request(
+        core: Core<C>,
+        request: PendingRequest<C>,
+        in_flight: &mut stream::FuturesUnordered<
+            Pin<Box<dyn Future<Output = (PendingRequest<C>, String, RedisResult<Value>)> + Send>>,
+        >,
+    ) {
+        match &request.info.cmd {
+            CmdArg::Cmd { cmd, routing } => {
+                let routing = match routing {
+                    InternalRoutingInfo::MultiNode(_) => {
+                        // Multi-node commands use the old path for now
+                        let info = request.info.clone();
+                        let core2 = core.clone();
+                        let sender = request.sender;
+                        let cmd_clone = request.info.cmd.clone();
+                        in_flight.push(Box::pin(async move {
+                            let result = ClusterConnInner::try_request(info, core2).await;
+                            match result {
+                                Ok(resp) => { let _ = sender.send(Ok(resp)); }
+                                Err((_, err)) => { let _ = sender.send(Err(err)); }
+                            }
+                            let dummy = PendingRequest {
+                                retry: u32::MAX,
+                                sender: oneshot::channel().0,
+                                info: RequestInfo { cmd: cmd_clone },
+                            };
+                            (dummy, String::new(), Err(RedisError::from((
+                                ErrorKind::ClientError, "already handled",
+                            ))))
+                        }));
+                        return;
+                    }
+                    InternalRoutingInfo::SingleNode(r) => r.clone(),
+                };
+                let cmd = cmd.clone();
+                match ClusterConnInner::route_and_send(cmd, routing, core, request).await {
+                    Some(in_flight_req) => {
+                        let InFlightRequest { receiver, request, address } = in_flight_req;
+                        in_flight.push(Box::pin(async move {
+                            let result = match receiver.await {
+                                Ok(r) => r,
+                                Err(_) => Err(RedisError::from((
+                                    ErrorKind::FatalReceiveError,
+                                    "Response channel closed",
+                                ))),
+                            };
+                            (request, address, result)
+                        }));
+                    }
+                    None => {} // route_and_send already responded with error
+                }
+            }
+            _ => {
+                // Pipelines, ClusterScan, OperationRequest — use old try_request path
+                let info = request.info.clone();
+                let core2 = core.clone();
+                let sender = request.sender;
+                let cmd_clone = request.info.cmd.clone();
+                in_flight.push(Box::pin(async move {
+                    let result = ClusterConnInner::try_request(info, core2).await;
+                    match result {
+                        Ok(resp) => { let _ = sender.send(Ok(resp)); }
+                        Err((_, err)) => { let _ = sender.send(Err(err)); }
+                    }
+                    let dummy = PendingRequest {
+                        retry: u32::MAX,
+                        sender: oneshot::channel().0,
+                        info: RequestInfo { cmd: cmd_clone },
+                    };
+                    (dummy, String::new(), Err(RedisError::from((
+                        ErrorKind::ClientError, "already handled",
+                    ))))
+                }));
+            }
+        }
     }
 
     /// Special handling for `SCAN` command, using `cluster_scan_with_pattern`.
