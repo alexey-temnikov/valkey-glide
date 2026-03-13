@@ -791,6 +791,121 @@ enum ResponseAction<C> {
     },
 }
 
+/// Process a completed response from an InFlightRequest.
+/// Determines whether to respond to the caller, retry, refresh slots, or reconnect.
+fn handle_response<C>(
+    mut in_flight: InFlightRequest<C>,
+    result: RedisResult<Value>,
+    retry_params: &RetryParams,
+) -> ResponseAction<C> {
+    // Caller gave up — drop silently
+    if in_flight.request.sender.is_closed() {
+        return ResponseAction::Done;
+    }
+
+    match result {
+        Ok(value) => {
+            let _ = in_flight.request.sender.send(Ok(Response::Single(value)));
+            ResponseAction::Done
+        }
+        Err(err) => {
+            let request = &mut in_flight.request;
+
+            // Max retries exhausted — respond with error and trigger recovery action
+            if request.retry >= retry_params.number_of_retries {
+                let action = exhausted_retries_action(&err, &in_flight.address);
+                let _ = in_flight.request.sender.send(Err(err));
+                return action;
+            }
+
+            request.retry = request.retry.saturating_add(1);
+            if let Err(e) = GlideOpenTelemetry::record_retry_attempt() {
+                log_error("OpenTelemetry:retry_error", format!("Failed to record retry attempt: {e}"));
+            }
+
+            if err.kind() == ErrorKind::AllConnectionsUnavailable {
+                return ResponseAction::ReconnectToInitialNodes {
+                    request: Some(in_flight.request),
+                };
+            }
+
+            let sleep_duration = retry_params.wait_time_for_retry(request.retry);
+
+            match err.retry_method() {
+                RetryMethod::AskRedirect => {
+                    let mut req = in_flight.request;
+                    req.info.set_redirect(
+                        err.redirect_node()
+                            .map(|(node, _slot)| Redirect::Ask(node.to_string(), true)),
+                    );
+                    ResponseAction::Retry { request: req }
+                }
+                RetryMethod::MovedRedirect => {
+                    let mut req = in_flight.request;
+                    let redirect_node = err.redirect_node();
+                    req.info.set_redirect(
+                        err.redirect_node()
+                            .map(|(node, _slot)| Redirect::Moved(node.to_string())),
+                    );
+                    ResponseAction::RefreshSlots {
+                        request: Some(req),
+                        moved_redirect: RedirectNode::from_option_tuple(redirect_node),
+                    }
+                }
+                RetryMethod::RefreshSlotsAndRetry => {
+                    let mut req = in_flight.request;
+                    req.info.reset_routing();
+                    ResponseAction::RefreshSlots {
+                        request: Some(req),
+                        moved_redirect: None,
+                    }
+                }
+                RetryMethod::WaitAndRetry | RetryMethod::RetryImmediately => {
+                    // For the select! loop, both become a retry (sleep handled externally if needed)
+                    ResponseAction::Retry { request: in_flight.request }
+                }
+                RetryMethod::Reconnect | RetryMethod::ReconnectAndRetry => {
+                    let mut req = in_flight.request;
+                    req.info.reset_routing();
+                    let should_retry = matches!(err.retry_method(), RetryMethod::ReconnectAndRetry);
+                    ResponseAction::Reconnect {
+                        request: should_retry.then_some(req),
+                        target: in_flight.address,
+                    }
+                }
+                RetryMethod::WaitAndRetryOnPrimaryRedirectOnReplica => {
+                    // Simplified: just retry
+                    ResponseAction::Retry { request: in_flight.request }
+                }
+                RetryMethod::NoRetry => {
+                    let _ = in_flight.request.sender.send(Err(err));
+                    ResponseAction::Done
+                }
+            }
+        }
+    }
+}
+
+/// When retries are exhausted, determine what recovery action to take (without retrying the request).
+fn exhausted_retries_action<C>(err: &RedisError, address: &str) -> ResponseAction<C> {
+    let retry_method = err.retry_method();
+    if err.kind() == ErrorKind::AllConnectionsUnavailable {
+        ResponseAction::ReconnectToInitialNodes { request: None }
+    } else if matches!(retry_method, RetryMethod::MovedRedirect | RetryMethod::RefreshSlotsAndRetry) {
+        ResponseAction::RefreshSlots {
+            request: None,
+            moved_redirect: RedirectNode::from_option_tuple(err.redirect_node()),
+        }
+    } else if matches!(retry_method, RetryMethod::Reconnect | RetryMethod::ReconnectAndRetry) {
+        ResponseAction::Reconnect {
+            request: None,
+            target: address.to_string(),
+        }
+    } else {
+        ResponseAction::Done
+    }
+}
+
 enum ConnectionState {
     PollComplete,
     Recover(RecoverFuture),
