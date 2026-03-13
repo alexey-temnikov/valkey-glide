@@ -10,6 +10,7 @@ use crate::types::{
 };
 use crate::PushKind;
 use ::tokio::io::{AsyncRead, AsyncWrite};
+use ::tokio::sync::oneshot;
 use async_trait::async_trait;
 use futures_util::Future;
 use std::net::SocketAddr;
@@ -60,6 +61,20 @@ pub trait ConnectionLike {
     /// Sends an already encoded (packed) command into the TCP socket and
     /// reads the single response from it.
     fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value>;
+
+    /// Fire-and-forget: sends a packed command and returns a Receiver for the response.
+    /// Default: not supported, returns error. Override in MultiplexedConnection.
+    fn req_packed_command_ff<'a>(
+        &'a mut self,
+        _cmd: &'a Cmd,
+    ) -> RedisFuture<'a, oneshot::Receiver<RedisResult<Value>>> {
+        Box::pin(async move {
+            Err(RedisError::from((
+                ErrorKind::ClientError,
+                "Fire-and-forget send not supported on this connection type",
+            )))
+        })
+    }
 
     /// Sends multiple already encoded (packed) command into the TCP socket
     /// and reads `count` responses from it.  This is used to implement

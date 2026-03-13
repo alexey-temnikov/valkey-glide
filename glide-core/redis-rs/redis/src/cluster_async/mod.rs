@@ -2641,6 +2641,36 @@ where
             .map_err(|err| (OperationTarget::FanOut, err))
     }
 
+    /// Route a single command and send it fire-and-forget.
+    /// Returns an InFlightRequest with the response receiver.
+    /// On routing/send failure, responds to the caller with the error and returns None.
+    async fn route_and_send(
+        cmd: Arc<Cmd>,
+        routing: InternalSingleNodeRouting<C>,
+        core: Core<C>,
+        request: PendingRequest<C>,
+    ) -> Option<InFlightRequest<C>> {
+        let (address, mut conn) = match Self::get_connection(routing, core, Some(cmd.clone())).await
+        {
+            Ok(pair) => pair,
+            Err(err) => {
+                let _ = request.sender.send(Err(err));
+                return None;
+            }
+        };
+        match conn.req_packed_command_ff(&cmd).await {
+            Ok(receiver) => Some(InFlightRequest {
+                receiver,
+                request,
+                address,
+            }),
+            Err(err) => {
+                let _ = request.sender.send(Err(err));
+                None
+            }
+        }
+    }
+
     pub(crate) async fn try_cmd_request(
         cmd: Arc<Cmd>,
         routing: InternalRoutingInfo<C>,

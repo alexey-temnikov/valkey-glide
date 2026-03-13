@@ -751,6 +751,13 @@ impl ConnectionLike for MultiplexedConnection {
         (async move { self.send_packed_command(cmd).await }).boxed()
     }
 
+    fn req_packed_command_ff<'a>(
+        &'a mut self,
+        cmd: &'a Cmd,
+    ) -> RedisFuture<'a, oneshot::Receiver<RedisResult<Value>>> {
+        (async move { self.send_packed_command_ff(cmd).await }).boxed()
+    }
+
     fn req_packed_commands<'a>(
         &'a mut self,
         cmd: &'a crate::Pipeline,
