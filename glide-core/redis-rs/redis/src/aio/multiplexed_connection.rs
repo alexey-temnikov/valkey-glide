@@ -370,6 +370,32 @@ where
         self.send_recv(item, None, timeout, true).await
     }
 
+    /// Send a command to the pipeline without waiting for the response.
+    /// Returns a Receiver that will contain the result when the server responds.
+    /// The caller is responsible for applying timeouts on the receiver.
+    async fn send_single_ff(
+        &mut self,
+        item: SinkItem,
+    ) -> RedisResult<oneshot::Receiver<RedisResult<Value>>> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(PipelineMessage {
+                input: item,
+                pipeline_response_count: None,
+                output: sender,
+                is_transaction: true,
+            })
+            .await
+            .map_err(|err| {
+                RedisError::from((
+                    crate::ErrorKind::FatalSendError,
+                    "Failed to send the request to the server",
+                    err.to_string(),
+                ))
+            })?;
+        Ok(receiver)
+    }
+
     async fn send_recv(
         &mut self,
         input: SinkItem,
@@ -542,7 +568,6 @@ impl MultiplexedConnection {
         if self.protocol != ProtocolVersion::RESP2 {
             if let Err(e) = &result {
                 if e.is_connection_dropped() {
-                    // Notify the PushManager that the connection was lost
                     self.push_manager.try_send_raw(&Value::Push {
                         kind: PushKind::Disconnection,
                         data: vec![],
@@ -551,6 +576,21 @@ impl MultiplexedConnection {
             }
         }
         result
+    }
+
+    /// Fire-and-forget: sends a packed command to the pipeline and returns
+    /// a Receiver for the response. Does NOT await the response.
+    /// The caller must apply their own timeout on the returned Receiver.
+    pub async fn send_packed_command_ff(
+        &mut self,
+        cmd: &Cmd,
+    ) -> RedisResult<oneshot::Receiver<RedisResult<Value>>> {
+        self.pipeline.send_single_ff(cmd.get_packed_command()).await
+    }
+
+    /// Returns the response timeout configured for this connection.
+    pub fn response_timeout(&self) -> std::time::Duration {
+        self.response_timeout
     }
 
     /// Sends multiple already encoded (packed) command into the TCP socket
