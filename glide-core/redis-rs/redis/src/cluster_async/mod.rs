@@ -759,6 +759,38 @@ enum RecoverFuture {
     Reconnect(BoxFuture<'static, ()>),
 }
 
+// --- New select!-loop types (Phase 2) ---
+
+/// An in-flight request: the command was sent to a connection, and we're
+/// waiting for the response. Holds everything needed to retry on error.
+struct InFlightRequest<C> {
+    receiver: oneshot::Receiver<RedisResult<Value>>,
+    request: PendingRequest<C>,
+    address: String,
+}
+
+/// What the main loop should do after processing a completed response.
+enum ResponseAction<C> {
+    /// Response delivered to caller. Nothing more to do.
+    Done,
+    /// Retry the request (ASK redirect, immediate retry, etc.)
+    Retry { request: PendingRequest<C> },
+    /// Refresh slots then optionally retry.
+    RefreshSlots {
+        request: Option<PendingRequest<C>>,
+        moved_redirect: Option<RedirectNode>,
+    },
+    /// Reconnect to a specific node then optionally retry.
+    Reconnect {
+        request: Option<PendingRequest<C>>,
+        target: String,
+    },
+    /// Reconnect to initial nodes.
+    ReconnectToInitialNodes {
+        request: Option<PendingRequest<C>>,
+    },
+}
+
 enum ConnectionState {
     PollComplete,
     Recover(RecoverFuture),
