@@ -123,6 +123,24 @@ use self::{
 };
 use crate::types::RetryMethod;
 
+/// Spawn a tokio task with a name (when tokio_unstable is enabled) or plain spawn otherwise.
+fn spawn_named<F>(name: &str, f: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let _ = name;
+    #[cfg(tokio_unstable)]
+    {
+        tokio::task::Builder::new()
+            .name(name)
+            .spawn(f)
+            .expect("failed to spawn task")
+    }
+    #[cfg(not(tokio_unstable))]
+    tokio::spawn(f)
+}
+
 pub(crate) const MUTEX_READ_ERR: &str = "Failed to obtain read lock. Poisoned mutex?";
 const MUTEX_WRITE_ERR: &str = "Failed to obtain write lock. Poisoned mutex?";
 /// This represents an async Cluster connection. It stores the
@@ -151,7 +169,7 @@ where
                         .await;
                 };
                 #[cfg(feature = "tokio-comp")]
-                tokio::spawn(stream);
+                spawn_named("cluster-forward", stream);
                 ClusterConnection(tx)
             })
     }
@@ -1209,7 +1227,7 @@ where
                 ClusterConnInner::periodic_topology_check(connection.inner.clone(), duration);
             #[cfg(feature = "tokio-comp")]
             {
-                connection.periodic_checks_handler = Some(tokio::spawn(periodic_task));
+                connection.periodic_checks_handler = Some(spawn_named("periodic-topology-check", periodic_task));
             }
         }
 
@@ -1220,7 +1238,7 @@ where
             #[cfg(feature = "tokio-comp")]
             {
                 connection.connections_validation_handler =
-                    Some(tokio::spawn(connections_validation_handler));
+                    Some(spawn_named("connections-validation", connections_validation_handler));
             }
         }
 
@@ -1518,7 +1536,8 @@ where
                 node_option = None;
             }
 
-            let handle = tokio::spawn(async move {
+            let task_name = format!("refresh-conn:{}", address_clone_for_task);
+            let handle = spawn_named(&task_name, async move {
                 info!(
                     "refreshing connection task to {:?} started",
                     address_clone_for_task
@@ -1645,7 +1664,7 @@ where
         let policy_clone = policy.clone();
 
         // Spawn the background task and return its handle
-        tokio::spawn(async move {
+        spawn_named("refresh-slots", async move {
             Self::refresh_slots_and_subscriptions_with_retries(
                 inner_clone,
                 &policy_clone,
