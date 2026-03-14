@@ -779,7 +779,6 @@ where
 
 pub(crate) struct ClusterConnInner<C> {
     pub(crate) inner: Core<C>,
-    state: ConnectionState,
     #[allow(clippy::complexity)]
     in_flight_requests: stream::FuturesUnordered<Pin<Box<Request<C>>>>,
     refresh_error: Option<RedisError>,
@@ -986,13 +985,7 @@ struct Message<C: Sized> {
     sender: oneshot::Sender<RedisResult<Response>>,
 }
 
-enum RecoverFuture {
-    RefreshingSlots(JoinHandle<RedisResult<()>>),
-    ReconnectToInitialNodes(BoxFuture<'static, ()>),
-    Reconnect(BoxFuture<'static, ()>),
-}
-
-// --- New select!-loop types (Phase 2) ---
+// --- select!-loop types ---
 
 /// An in-flight request: the command was sent to a connection, and we're
 /// waiting for the response. Holds everything needed to retry on error.
@@ -1136,24 +1129,6 @@ fn exhausted_retries_action<C>(err: &RedisError, address: &str) -> ResponseActio
         }
     } else {
         ResponseAction::Done
-    }
-}
-
-enum ConnectionState {
-    PollComplete,
-    Recover(RecoverFuture),
-}
-
-impl fmt::Debug for ConnectionState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                ConnectionState::PollComplete => "PollComplete",
-                ConnectionState::Recover(_) => "Recover",
-            }
-        )
     }
 }
 
@@ -1590,7 +1565,6 @@ where
             inner,
             in_flight_requests: Default::default(),
             refresh_error: None,
-            state: ConnectionState::PollComplete,
             periodic_checks_handler: None,
             connections_validation_handler: None,
         };
@@ -3496,114 +3470,6 @@ where
         Ok((address, conn))
     }
 
-    fn poll_recover(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), RedisError>> {
-        trace!("entered poll_recover");
-
-        let recover_future = match &mut self.state {
-            ConnectionState::PollComplete => return Poll::Ready(Ok(())),
-            ConnectionState::Recover(future) => future,
-        };
-
-        match recover_future {
-            RecoverFuture::RefreshingSlots(handle) => {
-                // Check if the task has completed
-                match handle.now_or_never() {
-                    Some(Ok(Ok(()))) => {
-                        // Task succeeded
-                        trace!("Slot refresh completed successfully!");
-                        self.state = ConnectionState::PollComplete;
-                        return Poll::Ready(Ok(()));
-                    }
-                    Some(Ok(Err(e))) => {
-                        // Task completed but returned an engine error
-                        trace!("Slot refresh failed: {:?}", e);
-
-                        if e.kind() == ErrorKind::AllConnectionsUnavailable {
-                            // If all connections unavailable, try reconnect
-                            self.state =
-                                ConnectionState::Recover(RecoverFuture::ReconnectToInitialNodes(
-                                    Box::pin(ClusterConnInner::reconnect_to_initial_nodes(
-                                        self.inner.clone(),
-                                    )),
-                                ));
-                            return Poll::Ready(Err(e));
-                        } else {
-                            // Retry refresh
-                            let new_handle = Self::spawn_refresh_slots_task(
-                                self.inner.clone(),
-                                &RefreshPolicy::Throttable,
-                            );
-                            self.state = ConnectionState::Recover(RecoverFuture::RefreshingSlots(
-                                new_handle,
-                            ));
-                            return Poll::Ready(Ok(()));
-                        }
-                    }
-                    Some(Err(join_err)) => {
-                        if join_err.is_cancelled() {
-                            // Task was intentionally aborted - don't treat as an error
-                            trace!("Slot refresh task was aborted");
-                            self.state = ConnectionState::PollComplete;
-                            return Poll::Ready(Ok(()));
-                        } else {
-                            // Task panicked - try reconnecting to initial nodes as a recovery strategy
-                            warn!("Slot refresh task panicked: {:?} - attempting recovery by reconnecting to initial nodes", join_err);
-
-                            // TODO - consider a gracefully closing of the client
-                            // Since a panic indicates a bug in the refresh logic,
-                            // it might be safer to close the client entirely
-                            self.state =
-                                ConnectionState::Recover(RecoverFuture::ReconnectToInitialNodes(
-                                    Box::pin(ClusterConnInner::reconnect_to_initial_nodes(
-                                        self.inner.clone(),
-                                    )),
-                                ));
-
-                            // Report this critical error to clients
-                            let err = RedisError::from((
-                                ErrorKind::ClientError,
-                                "Slot refresh task panicked",
-                                format!("{join_err:?}"),
-                            ));
-                            return Poll::Ready(Err(err));
-                        }
-                    }
-                    None => {
-                        // Task is still running
-                        // Just continue and return Ok to not block poll_flush
-                    }
-                }
-
-                // Always return Ready to not block poll_flush
-                Poll::Ready(Ok(()))
-            }
-            // Other cases remain unchanged
-            RecoverFuture::ReconnectToInitialNodes(ref mut future) => {
-                ready!(future.as_mut().poll(cx));
-                trace!("Reconnected to initial nodes");
-                self.state = ConnectionState::PollComplete;
-                Poll::Ready(Ok(()))
-            }
-            RecoverFuture::Reconnect(ref mut future) => {
-                ready!(future.as_mut().poll(cx));
-                trace!("Reconnected connections");
-                self.state = ConnectionState::PollComplete;
-                Poll::Ready(Ok(()))
-            }
-        }
-    }
-
-    async fn handle_loading_error_and_retry(
-        core: Core<C>,
-        info: RequestInfo<C>,
-        address: String,
-        retry: u32,
-        retry_params: RetryParams,
-    ) -> OperationResult {
-        Self::handle_loading_error(core.clone(), address, retry, retry_params).await;
-        Self::try_request(info, core).await
-    }
-
     async fn handle_loading_error(
         core: Core<C>,
         address: String,
@@ -3617,294 +3483,14 @@ where
             .is_primary(&address);
 
         if !is_primary {
-            // If the connection is a replica, remove the connection and retry.
-            // The connection will be established again on the next call to refresh slots once the replica is no longer in loading state.
             core.conn_lock
                 .read()
                 .expect(MUTEX_READ_ERR)
                 .remove_node(&address);
         } else {
-            // If the connection is primary, just sleep and retry
             let sleep_duration = retry_params.wait_time_for_retry(retry);
             boxed_sleep(sleep_duration).await;
         }
-    }
-
-    fn poll_complete(&mut self, cx: &mut task::Context<'_>) -> Poll<PollFlushAction> {
-        let retry_params = self
-            .inner
-            .get_cluster_param(|params| params.retry_params.clone())
-            .expect(MUTEX_READ_ERR);
-        let mut poll_flush_action = PollFlushAction::None;
-        let mut pending_requests_guard = self.inner.pending_requests.lock().unwrap();
-        if !pending_requests_guard.is_empty() {
-            let mut pending_requests = mem::take(&mut *pending_requests_guard);
-            for request in pending_requests.drain(..) {
-                // Drop the request if none is waiting for a response to free up resources for
-                // requests callers care about (load shedding). It will be ambiguous whether the
-                // request actually goes through regardless.
-                if request.sender.is_closed() {
-                    continue;
-                }
-
-                let future = Self::try_request(request.info.clone(), self.inner.clone()).boxed();
-                self.in_flight_requests.push(Box::pin(Request {
-                    retry_params: retry_params.clone(),
-                    request: Some(request),
-                    future: RequestState::Future { future },
-                }));
-            }
-            *pending_requests_guard = pending_requests;
-        }
-        drop(pending_requests_guard);
-
-        loop {
-            let retry_params = retry_params.clone();
-            let result = match Pin::new(&mut self.in_flight_requests).poll_next(cx) {
-                Poll::Ready(Some(result)) => result,
-                Poll::Ready(None) | Poll::Pending => break,
-            };
-            match result {
-                Next::Done => {}
-                Next::Retry { request } => {
-                    let future = Self::try_request(request.info.clone(), self.inner.clone());
-                    self.in_flight_requests.push(Box::pin(Request {
-                        retry_params: retry_params.clone(),
-                        request: Some(request),
-                        future: RequestState::Future {
-                            future: Box::pin(future),
-                        },
-                    }));
-                }
-                Next::RetryBusyLoadingError { request, address } => {
-                    // TODO - do we also want to try and reconnect to replica if it is loading?
-                    let future = Self::handle_loading_error_and_retry(
-                        self.inner.clone(),
-                        request.info.clone(),
-                        address,
-                        request.retry,
-                        retry_params.clone(),
-                    );
-                    self.in_flight_requests.push(Box::pin(Request {
-                        retry_params: retry_params.clone(),
-                        request: Some(request),
-                        future: RequestState::Future {
-                            future: Box::pin(future),
-                        },
-                    }));
-                }
-                Next::RefreshSlots {
-                    request,
-                    sleep_duration,
-                    moved_redirect,
-                } => {
-                    poll_flush_action =
-                        poll_flush_action.change_state(PollFlushAction::RebuildSlots);
-                    let future: Option<
-                        RequestState<Pin<Box<dyn Future<Output = OperationResult> + Send>>>,
-                    > = if let Some(moved_redirect) = moved_redirect {
-                        Some(RequestState::UpdateMoved {
-                            future: Box::pin(ClusterConnInner::update_upon_moved_error(
-                                self.inner.clone(),
-                                moved_redirect.slot,
-                                moved_redirect.address.into(),
-                            )),
-                        })
-                    } else if let Some(ref request) = request {
-                        match sleep_duration {
-                            Some(sleep_duration) => Some(RequestState::Sleep {
-                                sleep: boxed_sleep(sleep_duration),
-                            }),
-                            None => Some(RequestState::Future {
-                                future: Box::pin(Self::try_request(
-                                    request.info.clone(),
-                                    self.inner.clone(),
-                                )),
-                            }),
-                        }
-                    } else {
-                        None
-                    };
-                    if let Some(future) = future {
-                        self.in_flight_requests.push(Box::pin(Request {
-                            retry_params,
-                            request,
-                            future,
-                        }));
-                    }
-                }
-                Next::Reconnect { request, target } => {
-                    poll_flush_action = poll_flush_action
-                        .change_state(PollFlushAction::Reconnect(HashSet::from_iter([target])));
-                    if let Some(request) = request {
-                        self.inner.pending_requests.lock().unwrap().push(request);
-                    }
-                }
-                Next::ReconnectToInitialNodes { request } => {
-                    poll_flush_action = poll_flush_action
-                        .change_state(PollFlushAction::ReconnectFromInitialConnections);
-                    if let Some(request) = request {
-                        self.inner.pending_requests.lock().unwrap().push(request);
-                    }
-                }
-            }
-        }
-
-        if matches!(poll_flush_action, PollFlushAction::None) {
-            if self.in_flight_requests.is_empty() {
-                Poll::Ready(poll_flush_action)
-            } else {
-                Poll::Pending
-            }
-        } else {
-            Poll::Ready(poll_flush_action)
-        }
-    }
-
-    fn send_refresh_error(&mut self) {
-        if self.refresh_error.is_some() {
-            if let Some(mut request) = Pin::new(&mut self.in_flight_requests)
-                .iter_pin_mut()
-                .find(|request| request.request.is_some())
-            {
-                (*request)
-                    .as_mut()
-                    .respond(Err(self.refresh_error.take().unwrap()));
-            } else if let Some(request) = self.inner.pending_requests.lock().unwrap().pop() {
-                let _ = request.sender.send(Err(self.refresh_error.take().unwrap()));
-            }
-        }
-    }
-}
-
-enum PollFlushAction {
-    None,
-    RebuildSlots,
-    Reconnect(HashSet<String>),
-    ReconnectFromInitialConnections,
-}
-
-impl PollFlushAction {
-    fn change_state(self, next_state: PollFlushAction) -> PollFlushAction {
-        match (self, next_state) {
-            (PollFlushAction::None, next_state) => next_state,
-            (next_state, PollFlushAction::None) => next_state,
-            (PollFlushAction::ReconnectFromInitialConnections, _)
-            | (_, PollFlushAction::ReconnectFromInitialConnections) => {
-                PollFlushAction::ReconnectFromInitialConnections
-            }
-
-            (PollFlushAction::RebuildSlots, _) | (_, PollFlushAction::RebuildSlots) => {
-                PollFlushAction::RebuildSlots
-            }
-
-            (PollFlushAction::Reconnect(mut addrs), PollFlushAction::Reconnect(new_addrs)) => {
-                addrs.extend(new_addrs);
-                Self::Reconnect(addrs)
-            }
-        }
-    }
-}
-
-impl<C> Sink<Message<C>> for Disposable<ClusterConnInner<C>>
-where
-    C: ConnectionLike + Connect + Clone + Send + Sync + Unpin + 'static,
-{
-    type Error = ();
-
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut task::Context) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn start_send(self: Pin<&mut Self>, msg: Message<C>) -> Result<(), Self::Error> {
-        let Message { cmd, sender } = msg;
-
-        let info = RequestInfo { cmd };
-
-        self.inner
-            .pending_requests
-            .lock()
-            .unwrap()
-            .push(PendingRequest {
-                retry: 0,
-                sender,
-                info,
-            });
-        Ok(())
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut task::Context,
-    ) -> Poll<Result<(), Self::Error>> {
-        trace!("poll_flush: {:?}", self.state);
-        loop {
-            self.send_refresh_error();
-
-            if let Err(err) = ready!(self.as_mut().poll_recover(cx)) {
-                // We failed to reconnect, while we will try again we will report the
-                // error if we can to avoid getting trapped in an infinite loop of
-                // trying to reconnect
-                self.refresh_error = Some(err);
-
-                // Give other tasks a chance to progress before we try to recover
-                // again. Since the future may not have registered a wake up we do so
-                // now so the task is not forgotten
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-
-            match ready!(self.poll_complete(cx)) {
-                PollFlushAction::None => return Poll::Ready(Ok(())),
-                PollFlushAction::RebuildSlots => {
-                    // Spawn refresh task
-                    let task_handle = ClusterConnInner::spawn_refresh_slots_task(
-                        self.inner.clone(),
-                        &RefreshPolicy::Throttable,
-                    );
-
-                    // Update state
-                    self.state =
-                        ConnectionState::Recover(RecoverFuture::RefreshingSlots(task_handle));
-                }
-                PollFlushAction::ReconnectFromInitialConnections => {
-                    self.state =
-                        ConnectionState::Recover(RecoverFuture::ReconnectToInitialNodes(Box::pin(
-                            ClusterConnInner::reconnect_to_initial_nodes(self.inner.clone()),
-                        )));
-                }
-                PollFlushAction::Reconnect(addresses) => {
-                    self.state = ConnectionState::Recover(RecoverFuture::Reconnect(Box::pin(
-                        ClusterConnInner::trigger_refresh_connection_tasks(
-                            self.inner.clone(),
-                            addresses,
-                            RefreshConnectionType::OnlyUserConnection,
-                            true,
-                        )
-                        .map(|_| ()), // Convert Vec<Arc<Notify>> to () as it's not needed here
-                    )));
-                }
-            }
-        }
-    }
-
-    fn poll_close(
-        mut self: Pin<&mut Self>,
-        cx: &mut task::Context,
-    ) -> Poll<Result<(), Self::Error>> {
-        // Try to drive any in flight requests to completion
-        match self.poll_complete(cx) {
-            Poll::Ready(PollFlushAction::None) => (),
-            Poll::Ready(_) => Err(())?,
-            Poll::Pending => (),
-        };
-        // If we no longer have any requests in flight we are done (skips any reconnection
-        // attempts)
-        if self.in_flight_requests.is_empty() {
-            return Poll::Ready(Ok(()));
-        }
-
-        self.poll_flush(cx)
     }
 }
 
