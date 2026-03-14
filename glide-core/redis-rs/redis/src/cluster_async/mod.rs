@@ -224,8 +224,7 @@ where
                         let retry_params = inner.inner
                             .get_cluster_param(|p| p.retry_params.clone())
                             .expect(MUTEX_READ_ERR);
-                        let in_flight_req = InFlightRequest { receiver: oneshot::channel().1, request, address };
-                        match handle_response(in_flight_req, result, &retry_params) {
+                        match handle_response(request, address, result, &retry_params) {
                             ResponseAction::Done => {}
                             ResponseAction::Retry { request } => {
                                 // Can't retry during recovery — fail it
@@ -249,12 +248,7 @@ where
                     let retry_params = inner.inner
                         .get_cluster_param(|p| p.retry_params.clone())
                         .expect(MUTEX_READ_ERR);
-                    let in_flight_req = InFlightRequest {
-                        receiver: oneshot::channel().1, // dummy, already consumed
-                        request,
-                        address: address.clone(),
-                    };
-                    match handle_response(in_flight_req, result, &retry_params) {
+                    match handle_response(request, address, result, &retry_params) {
                         ResponseAction::Done => {}
                         ResponseAction::Retry { request } => {
                             Self::dispatch_request(inner.inner.clone(), request, &mut in_flight).await;
@@ -336,6 +330,10 @@ where
             Pin<Box<dyn Future<Output = (PendingRequest<C>, String, RedisResult<Value>)> + Send>>,
         >,
     ) {
+        let response_timeout = core
+            .get_cluster_param(|p| p.response_timeout)
+            .expect(MUTEX_READ_ERR);
+
         match &request.info.cmd {
             CmdArg::Cmd { cmd, routing } => {
                 let routing = match routing {
@@ -369,11 +367,15 @@ where
                     Some(in_flight_req) => {
                         let InFlightRequest { receiver, request, address } = in_flight_req;
                         in_flight.push(Box::pin(async move {
-                            let result = match receiver.await {
-                                Ok(r) => r,
-                                Err(_) => Err(RedisError::from((
+                            let result = match tokio::time::timeout(response_timeout, receiver).await {
+                                Ok(Ok(r)) => r,
+                                Ok(Err(_)) => Err(RedisError::from((
                                     ErrorKind::FatalReceiveError,
                                     "Response channel closed",
+                                ))),
+                                Err(_elapsed) => Err(RedisError::from((
+                                    ErrorKind::IoError,
+                                    "Response timed out",
                                 ))),
                             };
                             (request, address, result)
@@ -1017,30 +1019,26 @@ enum ResponseAction<C> {
     },
 }
 
-/// Process a completed response from an InFlightRequest.
-/// Determines whether to respond to the caller, retry, refresh slots, or reconnect.
+/// Process a completed response. Determines whether to respond, retry, or recover.
 fn handle_response<C>(
-    mut in_flight: InFlightRequest<C>,
+    mut request: PendingRequest<C>,
+    address: String,
     result: RedisResult<Value>,
     retry_params: &RetryParams,
 ) -> ResponseAction<C> {
-    // Caller gave up — drop silently
-    if in_flight.request.sender.is_closed() {
+    if request.sender.is_closed() {
         return ResponseAction::Done;
     }
 
     match result {
         Ok(value) => {
-            let _ = in_flight.request.sender.send(Ok(Response::Single(value)));
+            let _ = request.sender.send(Ok(Response::Single(value)));
             ResponseAction::Done
         }
         Err(err) => {
-            let request = &mut in_flight.request;
-
-            // Max retries exhausted — respond with error and trigger recovery action
             if request.retry >= retry_params.number_of_retries {
-                let action = exhausted_retries_action(&err, &in_flight.address);
-                let _ = in_flight.request.sender.send(Err(err));
+                let action = exhausted_retries_action(&err, &address);
+                let _ = request.sender.send(Err(err));
                 return action;
             }
 
@@ -1051,60 +1049,50 @@ fn handle_response<C>(
 
             if err.kind() == ErrorKind::AllConnectionsUnavailable {
                 return ResponseAction::ReconnectToInitialNodes {
-                    request: Some(in_flight.request),
+                    request: Some(request),
                 };
             }
 
-            let sleep_duration = retry_params.wait_time_for_retry(request.retry);
-
             match err.retry_method() {
                 RetryMethod::AskRedirect => {
-                    let mut req = in_flight.request;
-                    req.info.set_redirect(
+                    request.info.set_redirect(
                         err.redirect_node()
                             .map(|(node, _slot)| Redirect::Ask(node.to_string(), true)),
                     );
-                    ResponseAction::Retry { request: req }
+                    ResponseAction::Retry { request }
                 }
                 RetryMethod::MovedRedirect => {
-                    let mut req = in_flight.request;
                     let redirect_node = err.redirect_node();
-                    req.info.set_redirect(
+                    request.info.set_redirect(
                         err.redirect_node()
                             .map(|(node, _slot)| Redirect::Moved(node.to_string())),
                     );
                     ResponseAction::RefreshSlots {
-                        request: Some(req),
+                        request: Some(request),
                         moved_redirect: RedirectNode::from_option_tuple(redirect_node),
                     }
                 }
                 RetryMethod::RefreshSlotsAndRetry => {
-                    let mut req = in_flight.request;
-                    req.info.reset_routing();
+                    request.info.reset_routing();
                     ResponseAction::RefreshSlots {
-                        request: Some(req),
+                        request: Some(request),
                         moved_redirect: None,
                     }
                 }
-                RetryMethod::WaitAndRetry | RetryMethod::RetryImmediately => {
-                    // For the select! loop, both become a retry (sleep handled externally if needed)
-                    ResponseAction::Retry { request: in_flight.request }
+                RetryMethod::WaitAndRetry | RetryMethod::RetryImmediately
+                | RetryMethod::WaitAndRetryOnPrimaryRedirectOnReplica => {
+                    ResponseAction::Retry { request }
                 }
                 RetryMethod::Reconnect | RetryMethod::ReconnectAndRetry => {
-                    let mut req = in_flight.request;
-                    req.info.reset_routing();
+                    request.info.reset_routing();
                     let should_retry = matches!(err.retry_method(), RetryMethod::ReconnectAndRetry);
                     ResponseAction::Reconnect {
-                        request: should_retry.then_some(req),
-                        target: in_flight.address,
+                        request: should_retry.then_some(request),
+                        target: address,
                     }
                 }
-                RetryMethod::WaitAndRetryOnPrimaryRedirectOnReplica => {
-                    // Simplified: just retry
-                    ResponseAction::Retry { request: in_flight.request }
-                }
                 RetryMethod::NoRetry => {
-                    let _ = in_flight.request.sender.send(Err(err));
+                    let _ = request.sender.send(Err(err));
                     ResponseAction::Done
                 }
             }

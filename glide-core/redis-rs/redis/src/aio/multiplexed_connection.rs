@@ -372,28 +372,34 @@ where
 
     /// Send a command to the pipeline without waiting for the response.
     /// Returns a Receiver that will contain the result when the server responds.
-    /// The caller is responsible for applying timeouts on the receiver.
+    /// Includes a 100ms timeout on the pipeline send (same as send_recv).
     async fn send_single_ff(
         &mut self,
         item: SinkItem,
     ) -> RedisResult<oneshot::Receiver<RedisResult<Value>>> {
         let (sender, receiver) = oneshot::channel();
-        self.sender
-            .send(PipelineMessage {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            self.sender.send(PipelineMessage {
                 input: item,
                 pipeline_response_count: None,
                 output: sender,
                 is_transaction: true,
-            })
-            .await
-            .map_err(|err| {
-                RedisError::from((
-                    crate::ErrorKind::FatalSendError,
-                    "Failed to send the request to the server",
-                    err.to_string(),
-                ))
-            })?;
-        Ok(receiver)
+            }),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(receiver),
+            Ok(Err(err)) => Err(RedisError::from((
+                crate::ErrorKind::FatalSendError,
+                "Failed to send the request to the server",
+                err.to_string(),
+            ))),
+            Err(_elapsed) => Err(RedisError::from((
+                crate::ErrorKind::FatalSendError,
+                "Pipeline channel full for 100ms — connection likely dead",
+            ))),
+        }
     }
 
     async fn send_recv(
