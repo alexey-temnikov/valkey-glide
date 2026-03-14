@@ -185,6 +185,15 @@ where
         // Recovery future: None when healthy, Some when recovering.
         let mut recovery: Option<Pin<Box<dyn Future<Output = RedisResult<()>> + Send>>> = None;
 
+        // Cache cluster params to avoid mutex lock per request.
+        // Refreshed after recovery completes (params may change).
+        let mut retry_params = inner.inner
+            .get_cluster_param(|p| p.retry_params.clone())
+            .expect(MUTEX_READ_ERR);
+        let mut response_timeout = inner.inner
+            .get_cluster_param(|p| p.response_timeout)
+            .expect(MUTEX_READ_ERR);
+
         loop {
             // If recovering, drain channel and fail new requests immediately.
             if recovery.is_some() {
@@ -206,6 +215,13 @@ where
                         }
                         trace!("Recovery complete");
                         recovery = None;
+                        // Refresh cached params — they may have changed during recovery
+                        retry_params = inner.inner
+                            .get_cluster_param(|p| p.retry_params.clone())
+                            .expect(MUTEX_READ_ERR);
+                        response_timeout = inner.inner
+                            .get_cluster_param(|p| p.response_timeout)
+                            .expect(MUTEX_READ_ERR);
                     }
                     // Fail new requests during recovery
                     msg = rx.recv() => {
@@ -221,9 +237,6 @@ where
                     }
                     // Still process in-flight responses during recovery
                     Some((request, address, result)) = in_flight.next() => {
-                        let retry_params = inner.inner
-                            .get_cluster_param(|p| p.retry_params.clone())
-                            .expect(MUTEX_READ_ERR);
                         match handle_response(request, address, result, &retry_params) {
                             ResponseAction::Done => {}
                             ResponseAction::Retry { request } => {
@@ -245,13 +258,10 @@ where
                 biased;
                 // Process completed responses (read path)
                 Some((request, address, result)) = in_flight.next() => {
-                    let retry_params = inner.inner
-                        .get_cluster_param(|p| p.retry_params.clone())
-                        .expect(MUTEX_READ_ERR);
                     match handle_response(request, address, result, &retry_params) {
                         ResponseAction::Done => {}
                         ResponseAction::Retry { request } => {
-                            Self::dispatch_request(inner.inner.clone(), request, &mut in_flight).await;
+                            Self::dispatch_request(inner.inner.clone(), request, response_timeout, &mut in_flight).await;
                         }
                         ResponseAction::RefreshSlots { request, moved_redirect } => {
                             if let Some(redirect) = moved_redirect {
@@ -304,7 +314,7 @@ where
                                 sender,
                                 info: RequestInfo { cmd },
                             };
-                            Self::dispatch_request(inner.inner.clone(), request, &mut in_flight).await;
+                            Self::dispatch_request(inner.inner.clone(), request, response_timeout, &mut in_flight).await;
 
                             // Drain any pending_requests (from retries)
                             let pending: Vec<_> = {
@@ -312,7 +322,7 @@ where
                                 std::mem::take(&mut *guard)
                             };
                             for req in pending {
-                                Self::dispatch_request(inner.inner.clone(), req, &mut in_flight).await;
+                                Self::dispatch_request(inner.inner.clone(), req, response_timeout, &mut in_flight).await;
                             }
                         }
                         None => return, // channel closed
@@ -326,13 +336,11 @@ where
     async fn dispatch_request(
         core: Core<C>,
         request: PendingRequest<C>,
+        response_timeout: Duration,
         in_flight: &mut stream::FuturesUnordered<
             Pin<Box<dyn Future<Output = (PendingRequest<C>, String, RedisResult<Value>)> + Send>>,
         >,
     ) {
-        let response_timeout = core
-            .get_cluster_param(|p| p.response_timeout)
-            .expect(MUTEX_READ_ERR);
 
         match &request.info.cmd {
             CmdArg::Cmd { cmd, routing } => {
@@ -781,9 +789,6 @@ where
 
 pub(crate) struct ClusterConnInner<C> {
     pub(crate) inner: Core<C>,
-    #[allow(clippy::complexity)]
-    in_flight_requests: stream::FuturesUnordered<Pin<Box<Request<C>>>>,
-    refresh_error: Option<RedisError>,
     // Handler of the periodic check task.
     periodic_checks_handler: Option<JoinHandle<()>>,
     // Handler of fast connection validation task
@@ -1551,8 +1556,6 @@ where
         });
         let mut connection = ClusterConnInner {
             inner,
-            in_flight_requests: Default::default(),
-            refresh_error: None,
             periodic_checks_handler: None,
             connections_validation_handler: None,
         };
