@@ -186,3 +186,6 @@ required-features = ["aio"]
 
 [package.metadata.cargo-machete]
 ignored = ["strum"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }

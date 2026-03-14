@@ -416,15 +416,6 @@ impl Client {
                 glide_connection_options,
             )
             .await?;
-        #[cfg(tokio_unstable)]
-        {
-            let task_name = format!("mux-conn:{}", self.connection_info.addr);
-            tokio::task::Builder::new()
-                .name(&task_name)
-                .spawn(driver)
-                .expect("failed to spawn mux-conn task");
-        }
-        #[cfg(not(tokio_unstable))]
         T::spawn(driver);
         Ok((connection, ip))
     }

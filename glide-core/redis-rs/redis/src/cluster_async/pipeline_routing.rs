@@ -1,7 +1,6 @@
 use crate::aio::ConnectionLike;
 use crate::cluster_async::ClusterConnInner;
 use crate::cluster_async::Connect;
-use crate::cluster_async::MUTEX_READ_ERR;
 use crate::cluster_routing::RoutingInfo;
 use crate::cluster_routing::SlotAddr;
 use crate::cluster_routing::{

@@ -56,7 +56,7 @@ use rand::seq::IteratorRandom;
 
 use std::{
     collections::{HashMap, HashSet},
-    fmt, io, mem,
+    io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
@@ -124,25 +124,14 @@ use self::{
 use crate::types::RetryMethod;
 
 /// Spawn a tokio task with a name (when tokio_unstable is enabled) or plain spawn otherwise.
-fn spawn_named<F>(name: &str, f: F) -> JoinHandle<F::Output>
+fn spawn_named<F>(_name: &str, f: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let _ = name;
-    #[cfg(tokio_unstable)]
-    {
-        tokio::task::Builder::new()
-            .name(name)
-            .spawn(f)
-            .expect("failed to spawn task")
-    }
-    #[cfg(not(tokio_unstable))]
     tokio::spawn(f)
 }
 
-pub(crate) const MUTEX_READ_ERR: &str = "Failed to obtain read lock. Poisoned mutex?";
-const MUTEX_WRITE_ERR: &str = "Failed to obtain write lock. Poisoned mutex?";
 /// This represents an async Cluster connection. It stores the
 /// underlying connections maintained for each node in the cluster, as well
 /// as common parameters for connecting to nodes and executing commands.
@@ -189,10 +178,8 @@ where
         // Refreshed after recovery completes (params may change).
         let mut retry_params = inner.inner
             .get_cluster_param(|p| p.retry_params.clone());
-            ;
         let mut response_timeout = inner.inner
-            .get_cluster_param(|p| p.response_timeout)
-            ;
+            .get_cluster_param(|p| p.response_timeout);
 
         loop {
             // If recovering, drain channel and fail new requests immediately.
@@ -218,10 +205,8 @@ where
                         // Refresh cached params — they may have changed during recovery
                         retry_params = inner.inner
                             .get_cluster_param(|p| p.retry_params.clone());
-                            ;
                         response_timeout = inner.inner
-                            .get_cluster_param(|p| p.response_timeout)
-                            ;
+                            .get_cluster_param(|p| p.response_timeout);
                     }
                     // Fail new requests during recovery
                     msg = rx.recv() => {
@@ -1256,6 +1241,7 @@ pin_project! {
 }
 
 #[must_use]
+#[allow(dead_code)]
 enum Next<C> {
     Retry {
         request: PendingRequest<C>,
@@ -2004,25 +1990,6 @@ where
         }
         debug!("trigger_refresh_connection_tasks: Done");
         notifiers
-    }
-
-    fn spawn_refresh_slots_task(
-        inner: Arc<InnerCore<C>>,
-        policy: &RefreshPolicy,
-    ) -> JoinHandle<RedisResult<()>> {
-        // Clone references for task
-        let inner_clone = inner.clone();
-        let policy_clone = policy.clone();
-
-        // Spawn the background task and return its handle
-        spawn_named("refresh-slots", async move {
-            Self::refresh_slots_and_subscriptions_with_retries(
-                inner_clone,
-                &policy_clone,
-                SlotRefreshTrigger::RuntimeRefresh,
-            )
-            .await
-        })
     }
 
     /// Asynchronously collects and aggregates responses from multiple cluster nodes according to a specified policy.
@@ -3087,18 +3054,15 @@ where
             }
             CmdArg::OperationRequest(operation_request) => match operation_request {
                 Operation::UpdateConnectionPassword(password) => {
-                    core.set_cluster_param(|params| params.password = password)
-                        ;
+                    core.set_cluster_param(|params| params.password = password);
                     Ok(Response::Single(Value::Okay))
                 }
                 Operation::UpdateConnectionDatabase(database_id) => {
-                    core.set_cluster_param(|params| params.database_id = database_id)
-                        ;
+                    core.set_cluster_param(|params| params.database_id = database_id);
                     Ok(Response::Single(Value::Okay))
                 }
                 Operation::UpdateConnectionClientName(client_name) => {
-                    core.set_cluster_param(|params| params.client_name = client_name)
-                        ;
+                    core.set_cluster_param(|params| params.client_name = client_name);
                     Ok(Response::Single(Value::Okay))
                 }
                 Operation::GetUsername => {
