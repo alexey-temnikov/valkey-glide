@@ -169,7 +169,9 @@ pub fn init(minimal_level: Option<Level>, file_name: Option<&str>) -> Level {
             LevelFilter::TRACE
         };
 
-        // Enable logging only from allowed crates
+        // Enable logging only from allowed crates.
+        // tokio and runtime targets are included at TRACE level for console-subscriber
+        // (tokio-console) to receive task instrumentation spans.
         let targets_filter = filter::Targets::new()
             .with_target("glide", log_level)
             .with_target("redis", log_level)
@@ -180,7 +182,8 @@ pub fn init(minimal_level: Option<Level>, file_name: Option<&str>) -> Level {
             .with(stdout_layer)
             .with(file_layer)
             .with(targets_filter)
-            .init();
+            .try_init()
+            .ok();
 
         let reloads: Reloads = Reloads {
             console_reload: RwLock::new(stdout_reload),

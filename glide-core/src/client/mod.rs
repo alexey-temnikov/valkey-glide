@@ -1210,6 +1210,13 @@ async fn create_cluster_client(
     let connection_timeout = to_duration(request.connection_timeout, DEFAULT_CONNECTION_TIMEOUT);
     let mut builder = redis::cluster::ClusterClientBuilder::new(initial_nodes)
         .connection_timeout(connection_timeout)
+        // Set response_timeout to request_timeout/2 as defense-in-depth.
+        // Previously Duration::MAX — no connection-level timeout at all.
+        // This ensures requests already in the pipeline fail within 500ms
+        // (for 1000ms request_timeout) instead of waiting for TCP retransmit
+        // timeout (~6.5 minutes). The /2 factor leaves room for one retry
+        // within the overall request_timeout budget.
+        .response_timeout(to_duration(request.request_timeout, DEFAULT_RESPONSE_TIMEOUT) / 2)
         .retries(DEFAULT_RETRIES);
     let read_from_strategy = request.read_from.unwrap_or_default();
     builder = builder.read_from(match read_from_strategy {
