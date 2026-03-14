@@ -258,7 +258,7 @@ where
                                 sender,
                                 info: RequestInfo { cmd },
                             };
-                            Self::dispatch_request(inner.inner.clone(), request, response_timeout, &mut in_flight).await;
+                            Self::dispatch_request(inner.inner.clone(), request, response_timeout, &mut in_flight);
 
                             // Drain any pending_requests (from retries)
                             let pending: Vec<_> = {
@@ -266,7 +266,7 @@ where
                                 std::mem::take(&mut *guard)
                             };
                             for req in pending {
-                                Self::dispatch_request(inner.inner.clone(), req, response_timeout, &mut in_flight).await;
+                                Self::dispatch_request(inner.inner.clone(), req, response_timeout, &mut in_flight);
                             }
                         }
                         None => return, // channel closed
@@ -293,7 +293,7 @@ where
         match handle_response(request, address, result, retry_params) {
             ResponseAction::Done => {}
             ResponseAction::Retry { request } => {
-                Self::dispatch_request(inner.inner.clone(), request, response_timeout, in_flight).await;
+                Self::dispatch_request(inner.inner.clone(), request, response_timeout, in_flight);
             }
             ResponseAction::RefreshSlots { request, moved_redirect } => {
                 if let Some(redirect) = moved_redirect {
@@ -338,7 +338,10 @@ where
     }
 
     /// Route a request and add it to the in-flight collection.
-    async fn dispatch_request(
+    /// CRITICAL: This is non-blocking — all async work (get_connection, send,
+    /// wait for response) happens inside the future pushed to in_flight.
+    /// The select! loop never blocks on connection lookups or notifiers.
+    fn dispatch_request(
         core: Core<C>,
         request: PendingRequest<C>,
         response_timeout: Duration,
@@ -351,7 +354,7 @@ where
             CmdArg::Cmd { cmd, routing } => {
                 let routing = match routing {
                     InternalRoutingInfo::MultiNode(_) => {
-                        // Multi-node commands use the old path for now
+                        // Multi-node commands use the old path
                         let info = request.info.clone();
                         let core2 = core.clone();
                         let sender = request.sender;
@@ -376,10 +379,11 @@ where
                     InternalRoutingInfo::SingleNode(r) => r.clone(),
                 };
                 let cmd = cmd.clone();
-                match ClusterConnInner::route_and_send(cmd, routing, core, request).await {
-                    Some(in_flight_req) => {
-                        let InFlightRequest { receiver, request, address } = in_flight_req;
-                        in_flight.push(Box::pin(async move {
+                // Push entire route+send+wait as a single future — never blocks the loop
+                in_flight.push(Box::pin(async move {
+                    match ClusterConnInner::route_and_send(cmd, routing, core, request).await {
+                        Some(in_flight_req) => {
+                            let InFlightRequest { receiver, request, address } = in_flight_req;
                             let result = match tokio::time::timeout(response_timeout, receiver).await {
                                 Ok(Ok(r)) => r,
                                 Ok(Err(_)) => Err(RedisError::from((
@@ -392,10 +396,24 @@ where
                                 ))),
                             };
                             (request, address, result)
-                        }));
+                        }
+                        None => {
+                            // route_and_send already sent error to caller via sender
+                            // Return a dummy that will be ignored by handle_response
+                            let dummy = PendingRequest {
+                                retry: u32::MAX,
+                                sender: oneshot::channel().0,
+                                info: RequestInfo { cmd: CmdArg::Cmd {
+                                    cmd: Arc::new(crate::cmd("PING")),
+                                    routing: InternalRoutingInfo::SingleNode(InternalSingleNodeRouting::Random),
+                                }},
+                            };
+                            (dummy, String::new(), Err(RedisError::from((
+                                ErrorKind::ClientError, "dispatch failed",
+                            ))))
+                        }
                     }
-                    None => {} // route_and_send already responded with error
-                }
+                }));
             }
             _ => {
                 // Pipelines, ClusterScan, OperationRequest — use old try_request path
