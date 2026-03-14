@@ -256,53 +256,12 @@ where
             // Normal operation
             tokio::select! {
                 biased;
-                // Process completed responses (read path)
+                // Process completed responses (read path) — batch drain all ready
                 Some((request, address, result)) = in_flight.next() => {
-                    match handle_response(request, address, result, &retry_params) {
-                        ResponseAction::Done => {}
-                        ResponseAction::Retry { request } => {
-                            Self::dispatch_request(inner.inner.clone(), request, response_timeout, &mut in_flight).await;
-                        }
-                        ResponseAction::RefreshSlots { request, moved_redirect } => {
-                            if let Some(redirect) = moved_redirect {
-                                let _ = ClusterConnInner::update_upon_moved_error(
-                                    inner.inner.clone(), redirect.slot, redirect.address.into(),
-                                ).await;
-                            }
-                            recovery = Some(Box::pin(
-                                ClusterConnInner::refresh_slots_and_subscriptions_with_retries(
-                                    inner.inner.clone(),
-                                    &RefreshPolicy::Throttable,
-                                    SlotRefreshTrigger::RuntimeRefresh,
-                                ).map(|r| r.map(|_| ()))
-                            ));
-                            // Re-queue the request for retry after recovery
-                            if let Some(request) = request {
-                                inner.inner.pending_requests.lock().push(request);
-                            }
-                        }
-                        ResponseAction::Reconnect { request, target } => {
-                            recovery = Some(Box::pin(
-                                ClusterConnInner::trigger_refresh_connection_tasks(
-                                    inner.inner.clone(),
-                                    HashSet::from_iter([target]),
-                                    RefreshConnectionType::OnlyUserConnection,
-                                    true,
-                                ).map(|_| Ok(()))
-                            ));
-                            if let Some(request) = request {
-                                inner.inner.pending_requests.lock().push(request);
-                            }
-                        }
-                        ResponseAction::ReconnectToInitialNodes { request } => {
-                            recovery = Some(Box::pin(
-                                ClusterConnInner::reconnect_to_initial_nodes(inner.inner.clone())
-                                    .map(|_| Ok(()))
-                            ));
-                            if let Some(request) = request {
-                                inner.inner.pending_requests.lock().push(request);
-                            }
-                        }
+                    Self::process_response(&mut inner, &retry_params, response_timeout, &mut in_flight, &mut recovery, request, address, result).await;
+                    // Batch-drain: process all other ready responses without re-entering select!
+                    while let Some(Some((req, addr, res))) = in_flight.next().now_or_never() {
+                        Self::process_response(&mut inner, &retry_params, response_timeout, &mut in_flight, &mut recovery, req, addr, res).await;
                     }
                 }
                 // Accept new commands (write path)
@@ -327,6 +286,67 @@ where
                         }
                         None => return, // channel closed
                     }
+                }
+            }
+        }
+    }
+
+    /// Handle a single completed response — retry, recover, or respond to caller.
+    #[allow(clippy::too_many_arguments)]
+    async fn process_response(
+        inner: &mut Disposable<ClusterConnInner<C>>,
+        retry_params: &RetryParams,
+        response_timeout: Duration,
+        in_flight: &mut stream::FuturesUnordered<
+            Pin<Box<dyn Future<Output = (PendingRequest<C>, String, RedisResult<Value>)> + Send>>,
+        >,
+        recovery: &mut Option<Pin<Box<dyn Future<Output = RedisResult<()>> + Send>>>,
+        request: PendingRequest<C>,
+        address: String,
+        result: RedisResult<Value>,
+    ) {
+        match handle_response(request, address, result, retry_params) {
+            ResponseAction::Done => {}
+            ResponseAction::Retry { request } => {
+                Self::dispatch_request(inner.inner.clone(), request, response_timeout, in_flight).await;
+            }
+            ResponseAction::RefreshSlots { request, moved_redirect } => {
+                if let Some(redirect) = moved_redirect {
+                    let _ = ClusterConnInner::update_upon_moved_error(
+                        inner.inner.clone(), redirect.slot, redirect.address.into(),
+                    ).await;
+                }
+                *recovery = Some(Box::pin(
+                    ClusterConnInner::refresh_slots_and_subscriptions_with_retries(
+                        inner.inner.clone(),
+                        &RefreshPolicy::Throttable,
+                        SlotRefreshTrigger::RuntimeRefresh,
+                    ).map(|r| r.map(|_| ()))
+                ));
+                if let Some(request) = request {
+                    inner.inner.pending_requests.lock().push(request);
+                }
+            }
+            ResponseAction::Reconnect { request, target } => {
+                *recovery = Some(Box::pin(
+                    ClusterConnInner::trigger_refresh_connection_tasks(
+                        inner.inner.clone(),
+                        HashSet::from_iter([target]),
+                        RefreshConnectionType::OnlyUserConnection,
+                        true,
+                    ).map(|_| Ok(()))
+                ));
+                if let Some(request) = request {
+                    inner.inner.pending_requests.lock().push(request);
+                }
+            }
+            ResponseAction::ReconnectToInitialNodes { request } => {
+                *recovery = Some(Box::pin(
+                    ClusterConnInner::reconnect_to_initial_nodes(inner.inner.clone())
+                        .map(|_| Ok(()))
+                ));
+                if let Some(request) = request {
+                    inner.inner.pending_requests.lock().push(request);
                 }
             }
         }
@@ -2956,7 +2976,7 @@ where
                 return None;
             }
         };
-        match conn.req_packed_command_ff(&cmd).await {
+        match conn.req_packed_command_ff(&cmd) {
             Ok(receiver) => Some(InFlightRequest {
                 receiver,
                 request,

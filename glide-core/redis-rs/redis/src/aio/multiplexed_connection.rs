@@ -340,7 +340,7 @@ where
         T::Error: Send,
         T::Error: ::std::fmt::Debug,
     {
-        const BUFFER_SIZE: usize = 256;
+        const BUFFER_SIZE: usize = 4096;
         let (sender, mut receiver) = mpsc::channel(BUFFER_SIZE);
         let push_manager: Arc<ArcSwap<PushManager>> =
             Arc::new(ArcSwap::new(Arc::new(PushManager::default())));
@@ -372,32 +372,26 @@ where
 
     /// Send a command to the pipeline without waiting for the response.
     /// Returns a Receiver that will contain the result when the server responds.
-    /// Includes a 100ms timeout on the pipeline send (same as send_recv).
-    async fn send_single_ff(
+    /// Non-blocking: uses try_send with 4096 buffer. Only fails if channel full or closed.
+    fn send_single_ff(
         &mut self,
         item: SinkItem,
     ) -> RedisResult<oneshot::Receiver<RedisResult<Value>>> {
         let (sender, receiver) = oneshot::channel();
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            self.sender.send(PipelineMessage {
-                input: item,
-                pipeline_response_count: None,
-                output: sender,
-                is_transaction: true,
-            }),
-        )
-        .await
-        {
-            Ok(Ok(())) => Ok(receiver),
-            Ok(Err(err)) => Err(RedisError::from((
+        match self.sender.try_send(PipelineMessage {
+            input: item,
+            pipeline_response_count: None,
+            output: sender,
+            is_transaction: true,
+        }) {
+            Ok(()) => Ok(receiver),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(RedisError::from((
                 crate::ErrorKind::FatalSendError,
-                "Failed to send the request to the server",
-                err.to_string(),
+                "Pipeline channel full — connection likely dead",
             ))),
-            Err(_elapsed) => Err(RedisError::from((
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(RedisError::from((
                 crate::ErrorKind::FatalSendError,
-                "Pipeline channel full for 100ms — connection likely dead",
+                "Pipeline channel closed",
             ))),
         }
     }
@@ -586,12 +580,12 @@ impl MultiplexedConnection {
 
     /// Fire-and-forget: sends a packed command to the pipeline and returns
     /// a Receiver for the response. Does NOT await the response.
-    /// The caller must apply their own timeout on the returned Receiver.
-    pub async fn send_packed_command_ff(
+    /// Non-blocking: uses try_send on the pipeline channel.
+    pub fn send_packed_command_ff(
         &mut self,
         cmd: &Cmd,
     ) -> RedisResult<oneshot::Receiver<RedisResult<Value>>> {
-        self.pipeline.send_single_ff(cmd.get_packed_command()).await
+        self.pipeline.send_single_ff(cmd.get_packed_command())
     }
 
     /// Returns the response timeout configured for this connection.
@@ -757,11 +751,11 @@ impl ConnectionLike for MultiplexedConnection {
         (async move { self.send_packed_command(cmd).await }).boxed()
     }
 
-    fn req_packed_command_ff<'a>(
-        &'a mut self,
-        cmd: &'a Cmd,
-    ) -> RedisFuture<'a, oneshot::Receiver<RedisResult<Value>>> {
-        (async move { self.send_packed_command_ff(cmd).await }).boxed()
+    fn req_packed_command_ff(
+        &mut self,
+        cmd: &Cmd,
+    ) -> RedisResult<oneshot::Receiver<RedisResult<Value>>> {
+        self.send_packed_command_ff(cmd)
     }
 
     fn req_packed_commands<'a>(
