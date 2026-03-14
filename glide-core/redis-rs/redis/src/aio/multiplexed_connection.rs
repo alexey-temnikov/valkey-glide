@@ -340,7 +340,7 @@ where
         T::Error: Send,
         T::Error: ::std::fmt::Debug,
     {
-        const BUFFER_SIZE: usize = 50;
+        const BUFFER_SIZE: usize = 256;
         let (sender, mut receiver) = mpsc::channel(BUFFER_SIZE);
         let push_manager: Arc<ArcSwap<PushManager>> =
             Arc::new(ArcSwap::new(Arc::new(PushManager::default())));

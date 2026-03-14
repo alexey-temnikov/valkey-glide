@@ -61,7 +61,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{self, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     task::{self, Poll},
     time::SystemTime,
@@ -109,7 +109,7 @@ use tokio::{sync::Notify, time::timeout};
 use dispose::{Disposable, Dispose};
 use futures::{future::BoxFuture, prelude::*, ready};
 use pin_project_lite::pin_project;
-use std::sync::RwLock as StdRwLock;
+use parking_lot::{Mutex, RwLock as StdRwLock};
 use tokio::sync::{
     mpsc,
     oneshot::{self, Receiver},
@@ -161,7 +161,7 @@ where
         ClusterConnInner::new(initial_nodes, cluster_params, push_sender)
             .await
             .map(|inner| {
-                let (tx, rx) = mpsc::channel::<Message<_>>(100);
+                let (tx, rx) = mpsc::channel::<Message<_>>(1000);
                 #[cfg(feature = "tokio-comp")]
                 spawn_named("cluster-forward", Self::cluster_task(inner, rx));
                 ClusterConnection(tx)
@@ -188,11 +188,11 @@ where
         // Cache cluster params to avoid mutex lock per request.
         // Refreshed after recovery completes (params may change).
         let mut retry_params = inner.inner
-            .get_cluster_param(|p| p.retry_params.clone())
-            .expect(MUTEX_READ_ERR);
+            .get_cluster_param(|p| p.retry_params.clone());
+            ;
         let mut response_timeout = inner.inner
             .get_cluster_param(|p| p.response_timeout)
-            .expect(MUTEX_READ_ERR);
+            ;
 
         loop {
             // If recovering, drain channel and fail new requests immediately.
@@ -217,11 +217,11 @@ where
                         recovery = None;
                         // Refresh cached params — they may have changed during recovery
                         retry_params = inner.inner
-                            .get_cluster_param(|p| p.retry_params.clone())
-                            .expect(MUTEX_READ_ERR);
+                            .get_cluster_param(|p| p.retry_params.clone());
+                            ;
                         response_timeout = inner.inner
                             .get_cluster_param(|p| p.response_timeout)
-                            .expect(MUTEX_READ_ERR);
+                            ;
                     }
                     // Fail new requests during recovery
                     msg = rx.recv() => {
@@ -278,7 +278,7 @@ where
                             ));
                             // Re-queue the request for retry after recovery
                             if let Some(request) = request {
-                                inner.inner.pending_requests.lock().unwrap().push(request);
+                                inner.inner.pending_requests.lock().push(request);
                             }
                         }
                         ResponseAction::Reconnect { request, target } => {
@@ -291,7 +291,7 @@ where
                                 ).map(|_| Ok(()))
                             ));
                             if let Some(request) = request {
-                                inner.inner.pending_requests.lock().unwrap().push(request);
+                                inner.inner.pending_requests.lock().push(request);
                             }
                         }
                         ResponseAction::ReconnectToInitialNodes { request } => {
@@ -300,7 +300,7 @@ where
                                     .map(|_| Ok(()))
                             ));
                             if let Some(request) = request {
-                                inner.inner.pending_requests.lock().unwrap().push(request);
+                                inner.inner.pending_requests.lock().push(request);
                             }
                         }
                     }
@@ -318,7 +318,7 @@ where
 
                             // Drain any pending_requests (from retries)
                             let pending: Vec<_> = {
-                                let mut guard = inner.inner.pending_requests.lock().unwrap();
+                                let mut guard = inner.inner.pending_requests.lock();
                                 std::mem::take(&mut *guard)
                             };
                             for req in pending {
@@ -703,27 +703,19 @@ impl<C> InnerCore<C>
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
-    fn get_cluster_param<T, F>(&self, f: F) -> Result<T, RedisError>
+    fn get_cluster_param<T, F>(&self, f: F) -> T
     where
         F: FnOnce(&ClusterParams) -> T,
         T: Clone,
     {
-        self.cluster_params
-            .read()
-            .map(|guard| f(&guard).clone())
-            .map_err(|_| RedisError::from((ErrorKind::ClientError, MUTEX_READ_ERR)))
+        f(&self.cluster_params.read()).clone()
     }
 
-    fn set_cluster_param<F>(&self, f: F) -> Result<(), RedisError>
+    fn set_cluster_param<F>(&self, f: F)
     where
         F: FnOnce(&mut ClusterParams),
     {
-        self.cluster_params
-            .write()
-            .map(|mut params| {
-                f(&mut params);
-            })
-            .map_err(|_| RedisError::from((ErrorKind::ClientError, MUTEX_WRITE_ERR)))
+        f(&mut self.cluster_params.write());
     }
 
     // return epoch of node
@@ -732,7 +724,7 @@ where
         let node_conn = self
             .conn_lock
             .read()
-            .expect(MUTEX_READ_ERR)
+            
             .connection_for_address(node_address)
             .ok_or(RedisError::from((
                 ErrorKind::ResponseError,
@@ -769,7 +761,7 @@ where
     pub(crate) async fn slots_of_address(&self, node_address: Arc<String>) -> Vec<u16> {
         self.conn_lock
             .read()
-            .expect(MUTEX_READ_ERR)
+            
             .slot_map
             .get_slots_of_node(node_address)
     }
@@ -781,7 +773,7 @@ where
     ) -> Option<ConnectionFuture<C>> {
         self.conn_lock
             .read()
-            .expect(MUTEX_READ_ERR)
+            
             .connection_for_address(address)
             .map(|(_, conn)| conn)
     }
@@ -797,7 +789,7 @@ pub(crate) struct ClusterConnInner<C> {
 
 impl<C> Dispose for ClusterConnInner<C> {
     fn dispose(self) {
-        if let Ok(conn_lock) = self.inner.conn_lock.try_read() {
+        if let Some(conn_lock) = self.inner.conn_lock.try_read() {
             // Each node may contain user and *maybe* a management connection
             let mut count = 0usize;
             for node in conn_lock.connection_map() {
@@ -1699,13 +1691,7 @@ where
     // Being used when all cluster connections are unavailable.
     fn reconnect_to_initial_nodes(inner: Arc<InnerCore<C>>) -> impl Future<Output = ()> {
         let inner = inner.clone();
-        let cluster_params = match inner.get_cluster_param(|params| params.clone()) {
-            Ok(params) => params,
-            Err(err) => {
-                warn!("Failed to get cluster params: {}", err);
-                return async {}.boxed();
-            }
-        };
+        let cluster_params = inner.get_cluster_param(|params| params.clone());
         Box::pin(async move {
             let connection_map = match Self::create_initial_connections(
                 &inner.initial_nodes,
@@ -1723,7 +1709,7 @@ where
             inner
                 .conn_lock
                 .write()
-                .expect(MUTEX_WRITE_ERR)
+                
                 .extend_connection_map(connection_map);
             if let Err(err) = Self::refresh_slots_and_subscriptions_with_retries(
                 inner.clone(),
@@ -1761,7 +1747,7 @@ where
         let mut nodes_to_delete = Vec::new();
         let all_nodes_with_slots: HashSet<Arc<String>>;
         {
-            let connections_container = inner.conn_lock.read().expect(MUTEX_READ_ERR);
+            let connections_container = inner.conn_lock.read();
 
             all_nodes_with_slots = connections_container.slot_map.all_node_addresses();
 
@@ -1855,7 +1841,7 @@ where
             if let Some(existing_task) = inner
                 .conn_lock
                 .read()
-                .expect(MUTEX_READ_ERR)
+                
                 .refresh_conn_state
                 .refresh_address_in_progress
                 .get(&address)
@@ -1874,7 +1860,7 @@ where
             let mut node_option = inner
                 .conn_lock
                 .read()
-                .expect(MUTEX_READ_ERR)
+                
                 .remove_node(&address);
 
             if !check_existing_conn {
@@ -1904,7 +1890,7 @@ where
                     let mut cluster_params = inner_clone
                         .cluster_params
                         .read()
-                        .expect(MUTEX_READ_ERR)
+                        
                         .clone();
                     let subs_guard = inner_clone.subscriptions_by_address.read().await;
                     cluster_params.pubsub_subscriptions =
@@ -1929,7 +1915,7 @@ where
                                 if let Some(ref mut conn_state) = inner_clone
                                     .conn_lock
                                     .write()
-                                    .expect(MUTEX_WRITE_ERR)
+                                    
                                     .refresh_conn_state
                                     .refresh_address_in_progress
                                     .get_mut(&address_clone_for_task)
@@ -1957,7 +1943,7 @@ where
                         inner_clone
                             .conn_lock
                             .read()
-                            .expect(MUTEX_READ_ERR)
+                            
                             .replace_or_add_connection_for_address(&address_clone_for_task, node);
                     }
                     Err(err) => {
@@ -1971,7 +1957,7 @@ where
                 inner_clone
                     .conn_lock
                     .write()
-                    .expect(MUTEX_READ_ERR)
+                    
                     .refresh_conn_state
                     .refresh_address_in_progress
                     .remove(&address_clone_for_task);
@@ -1991,7 +1977,7 @@ where
             inner
                 .conn_lock
                 .write()
-                .expect(MUTEX_READ_ERR)
+                
                 .refresh_conn_state
                 .refresh_address_in_progress
                 .insert(address.clone(), refresh_task_state);
@@ -2508,7 +2494,7 @@ where
     }
 
     async fn refresh_pubsub_subscriptions(inner: Arc<InnerCore<C>>) {
-        if inner.cluster_params.read().expect(MUTEX_READ_ERR).protocol
+        if inner.cluster_params.read().protocol
             != crate::types::ProtocolVersion::RESP3
         {
             return;
@@ -2518,7 +2504,7 @@ where
         {
             let mut subs_by_address_guard = inner.subscriptions_by_address.write().await;
             let mut unassigned_subs_guard = inner.unassigned_subscriptions.write().await;
-            let conns_read_guard = inner.conn_lock.read().expect(MUTEX_READ_ERR);
+            let conns_read_guard = inner.conn_lock.read();
             // validate active subscriptions location
             subs_by_address_guard.retain(|current_address, address_subs| {
                 address_subs.retain(|kind, channels_patterns| {
@@ -2597,7 +2583,7 @@ where
     /// topology view differs from the one currently stored in the connection manager.
     /// Returns true if change was detected, otherwise false.
     async fn check_for_topology_diff(inner: Arc<InnerCore<C>>) -> bool {
-        let num_of_nodes = inner.conn_lock.read().expect(MUTEX_READ_ERR).len();
+        let num_of_nodes = inner.conn_lock.read().len();
         let num_of_nodes_to_query =
             std::cmp::max(num_of_nodes.checked_ilog2().unwrap_or(0) as usize, 1);
         let TopologyQueryResult {
@@ -2615,7 +2601,7 @@ where
             if inner
                 .conn_lock
                 .read()
-                .expect(MUTEX_READ_ERR)
+                
                 .get_current_topology_hash()
                 != found_topology_hash
             {
@@ -2658,7 +2644,7 @@ where
         curr_retry: usize,
         trigger: SlotRefreshTrigger,
     ) -> RedisResult<()> {
-        let num_of_nodes = inner.conn_lock.read().expect(MUTEX_READ_ERR).len();
+        let num_of_nodes = inner.conn_lock.read().len();
         const MAX_REQUESTED_NODES: usize = 10;
         let num_of_nodes_to_query = num_of_nodes.min(MAX_REQUESTED_NODES);
 
@@ -2686,7 +2672,7 @@ where
             if let Some(node) = inner
                 .conn_lock
                 .read()
-                .expect(MUTEX_READ_ERR)
+                
                 .node_for_address(&addr)
             {
                 addresses_and_connections.push((addr, Some(node)));
@@ -2700,7 +2686,7 @@ where
                     .await
                     .ok()
                     .and_then(|mut socket_addresses| {
-                        let conn_lock = inner.conn_lock.read().expect(MUTEX_READ_ERR);
+                        let conn_lock = inner.conn_lock.read();
                         socket_addresses.find_map(|socket_addr| {
                             conn_lock.node_for_address(&socket_addr.to_string())
                         })
@@ -2714,7 +2700,7 @@ where
 
         let cluster_params = inner
             .get_cluster_param(|params| params.clone())
-            .expect(MUTEX_READ_ERR);
+            ;
         let glide_connection_options = &inner.glide_connection_options;
 
         let subs_guard = inner.subscriptions_by_address.read().await;
@@ -2754,13 +2740,13 @@ where
 
         info!("refresh_slots found nodes:\n{new_connections}");
         // Reset the current slot map and connection vector with the new ones
-        let mut write_guard = inner.conn_lock.write().expect(MUTEX_WRITE_ERR);
+        let mut write_guard = inner.conn_lock.write();
         // Clear the refresh tasks of the prev instance
         // TODO - Maybe we can take the running refresh tasks and use them instead of running new connection creation
         write_guard.refresh_conn_state.clear_refresh_state();
         let read_from_replicas = inner
             .get_cluster_param(|params| params.read_from_replicas.clone())
-            .expect(MUTEX_READ_ERR);
+            ;
         *write_guard = ConnectionsContainer::new(
             new_slots,
             new_connections,
@@ -2798,7 +2784,7 @@ where
         let curr_shard_addrs = inner
             .conn_lock
             .read()
-            .expect(MUTEX_READ_ERR)
+            
             .slot_map
             .shard_addrs_for_slot(slot);
         // let curr_shard_addrs = connections_container.slot_map.shard_addrs_for_slot(slot);
@@ -2815,7 +2801,7 @@ where
 
         // Scenario 3 & 4: Check if the new primary exists in other shards
 
-        let mut wlock_conn_container = inner.conn_lock.write().expect(MUTEX_READ_ERR);
+        let mut wlock_conn_container = inner.conn_lock.write();
         let mut nodes_iter = wlock_conn_container.slot_map_nodes();
         for (node_addr, (ip_addr, shard_addrs_arc)) in &mut nodes_iter {
             if node_addr == new_primary {
@@ -2904,7 +2890,7 @@ where
         }
         let (receivers, requests): (Vec<_>, Vec<_>);
         {
-            let connections_container = core.conn_lock.read().expect(MUTEX_READ_ERR);
+            let connections_container = core.conn_lock.read();
             if connections_container.is_empty() {
                 return OperationResult::Err((
                     OperationTarget::FanOut,
@@ -2945,7 +2931,6 @@ where
         }
         core.pending_requests
             .lock()
-            .unwrap()
             .extend(requests.into_iter().flatten());
 
         Self::aggregate_results(receivers, routing, response_policy)
@@ -3083,23 +3068,23 @@ where
             CmdArg::OperationRequest(operation_request) => match operation_request {
                 Operation::UpdateConnectionPassword(password) => {
                     core.set_cluster_param(|params| params.password = password)
-                        .expect(MUTEX_WRITE_ERR);
+                        ;
                     Ok(Response::Single(Value::Okay))
                 }
                 Operation::UpdateConnectionDatabase(database_id) => {
                     core.set_cluster_param(|params| params.database_id = database_id)
-                        .expect(MUTEX_WRITE_ERR);
+                        ;
                     Ok(Response::Single(Value::Okay))
                 }
                 Operation::UpdateConnectionClientName(client_name) => {
                     core.set_cluster_param(|params| params.client_name = client_name)
-                        .expect(MUTEX_WRITE_ERR);
+                        ;
                     Ok(Response::Single(Value::Okay))
                 }
                 Operation::GetUsername => {
                     let username = match core
                         .get_cluster_param(|params| params.username.clone())
-                        .expect(MUTEX_READ_ERR)
+                        
                     {
                         Some(username) => Value::SimpleString(username),
                         None => Value::Nil,
@@ -3264,7 +3249,7 @@ where
             } => core
                 .conn_lock
                 .read()
-                .expect(MUTEX_READ_ERR)
+                
                 .connection_for_address(moved_addr.as_str())
                 .map_or(
                     ConnectionCheck::OnlyAddress(moved_addr),
@@ -3277,7 +3262,7 @@ where
                 asking = should_exec_asking;
                 core.conn_lock
                     .read()
-                    .expect(MUTEX_READ_ERR)
+                    
                     .connection_for_address(ask_addr.as_str())
                     .map_or(
                         ConnectionCheck::OnlyAddress(ask_addr),
@@ -3287,7 +3272,7 @@ where
             InternalSingleNodeRouting::SpecificNode(route) => {
                 // Step 1: Attempt to get the connection directly using the route.
                 let conn_check = {
-                    let conn_lock = core.conn_lock.read().expect(MUTEX_READ_ERR);
+                    let conn_lock = core.conn_lock.read();
                     conn_lock
                         .connection_for_route(&route)
                         .map(ConnectionCheck::Found)
@@ -3323,7 +3308,7 @@ where
 
                     // Step 3: Obtain the reconnect notifier, ensuring the lock is released immediately after.
                     let reconnect_notifier = {
-                        let conn_lock = core.conn_lock.read().expect(MUTEX_READ_ERR);
+                        let conn_lock = core.conn_lock.read();
                         conn_lock.notifier_for_route(&route).clone()
                     };
 
@@ -3343,7 +3328,7 @@ where
                         if let Some((conn, address)) = core
                             .conn_lock
                             .read()
-                            .expect(MUTEX_READ_ERR)
+                            
                             .connection_for_route(&route)
                         {
                             conn_check = ConnectionCheck::Found((conn, address));
@@ -3369,7 +3354,7 @@ where
                 let conn_option = core
                     .conn_lock
                     .read()
-                    .expect(MUTEX_READ_ERR)
+                    
                     .connection_for_address(&address);
                 if let Some((address, conn)) = conn_option {
                     return Ok((address, conn.await));
@@ -3419,7 +3404,7 @@ where
                 let conn_option = core
                     .conn_lock
                     .read()
-                    .expect(MUTEX_READ_ERR)
+                    
                     .connection_for_address(&address);
 
                 if let Some((address, conn)) = conn_option {
@@ -3438,7 +3423,7 @@ where
                 let random_conn = core
                     .conn_lock
                     .read()
-                    .expect(MUTEX_READ_ERR)
+                    
                     .random_connections(1, ConnectionType::User);
                 let (random_address, random_conn_future) =
                     match random_conn.and_then(|conn_iter| conn_iter.into_iter().next()) {
@@ -3470,13 +3455,13 @@ where
         let is_primary = core
             .conn_lock
             .read()
-            .expect(MUTEX_READ_ERR)
+            
             .is_primary(&address);
 
         if !is_primary {
             core.conn_lock
                 .read()
-                .expect(MUTEX_READ_ERR)
+                
                 .remove_node(&address);
         } else {
             let sleep_duration = retry_params.wait_time_for_retry(retry);
@@ -3558,7 +3543,7 @@ where
 
     // Only refresh and retry if we have no connections at all
     if connections.is_empty() && !addresses_needing_refresh.is_empty() {
-        let connection_timeout = inner.get_cluster_param(|p| p.connection_timeout)?;
+        let connection_timeout = inner.get_cluster_param(|p| p.connection_timeout);
 
         // Wait for connection refresh to complete (with timeout)
         let _ = tokio::time::timeout(
@@ -3648,7 +3633,7 @@ where
     let original_addr_key = Arc::new(original_addr.to_string());
 
     let (canonical_addr, conn_opt) = {
-        let conn_lock = inner.conn_lock.read().expect(MUTEX_READ_ERR);
+        let conn_lock = inner.conn_lock.read();
 
         // Resolve canonical address using the lookup chain:
         let canonical_addr = if conn_lock
@@ -3710,8 +3695,7 @@ where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
     let refresh_topology_from_initial_nodes = inner
-        .get_cluster_param(|p| p.refresh_topology_from_initial_nodes)
-        .unwrap_or(false);
+        .get_cluster_param(|p| p.refresh_topology_from_initial_nodes);
 
     // During initial connection, use existing connections to avoid double DNS lookup
     let use_initial_nodes_lookup = refresh_topology_from_initial_nodes
@@ -3734,7 +3718,7 @@ where
     } else if let Some(random_conns) = inner
         .conn_lock
         .read()
-        .expect(MUTEX_READ_ERR)
+        
         .random_connections(num_of_nodes_to_query, ConnectionType::PreferManagement)
     {
         (random_conns, HashSet::new())
@@ -3773,11 +3757,11 @@ where
     });
     let tls_mode = inner
         .get_cluster_param(|params| params.tls)
-        .expect(MUTEX_READ_ERR);
+        ;
 
     let read_from_replicas = inner
         .get_cluster_param(|params| params.read_from_replicas.clone())
-        .expect(MUTEX_READ_ERR);
+        ;
     TopologyQueryResult {
         topology_result: calculate_topology(
             topology_values,
